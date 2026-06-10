@@ -15,6 +15,7 @@ export interface PublishDeps {
   readonly invalidateCache: () => void
   readonly onPublishInitiated: (url: RelayUrl) => void
   readonly getOrCreateConnection: (url: RelayUrl) => RelayState | null
+  readonly releaseIfIdle: (url: RelayUrl, state: RelayState) => void
 }
 
 export const createPublish = (deps: PublishDeps) => {
@@ -26,6 +27,7 @@ export const createPublish = (deps: PublishDeps) => {
     invalidateCache,
     onPublishInitiated,
     getOrCreateConnection,
+    releaseIfIdle,
   } = deps
   return (url: RelayUrl, event: NostrEvent): Promise<PublishResponse> =>
     new Promise((resolve) => {
@@ -72,6 +74,9 @@ export const createPublish = (deps: PublishDeps) => {
         invalidateCache()
         const response: PublishResponse = { from: url, ...ack }
         for (const resolver of inFlight.resolvers) resolver(response)
+        // A publish-only socket has no unsubscribe to drain it, so the last settle is its release
+        // point — without this a socket opened just to publish would stay open forever.
+        releaseIfIdle(url, state)
       }
 
       const timeoutId = scheduler.setTimer(() => settle("timeout", { ok: false, message: "timeout" }), publishTimeoutMs)

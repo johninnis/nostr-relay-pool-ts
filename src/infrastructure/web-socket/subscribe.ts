@@ -16,10 +16,16 @@ export interface SubscribeDeps {
   readonly scheduler: Scheduler
   readonly pendingSubTimeoutMs: number
   readonly subHistory: SubHistoryMap
-  readonly connections: ReadonlyMap<RelayUrl, RelayState>
+  /**
+   * Resolve the state that owns `subId` — the live connection, or the state parked on a pending
+   * reconnect after its socket dropped. Unsubscribe must reach the parked state too: a sub left
+   * there would be resurrected by the reconnect as a REQ no caller can ever close.
+   */
+  readonly findOwningState: (url: RelayUrl, subId: string) => RelayState | undefined
   readonly invalidateCache: () => void
   readonly isDisposed: () => boolean
   readonly getOrCreateConnection: (url: RelayUrl) => RelayState | null
+  readonly releaseIfIdle: (url: RelayUrl, state: RelayState) => void
 }
 
 export const createSubscribe = (deps: SubscribeDeps) => {
@@ -28,10 +34,11 @@ export const createSubscribe = (deps: SubscribeDeps) => {
     scheduler,
     pendingSubTimeoutMs,
     subHistory,
-    connections,
+    findOwningState,
     invalidateCache,
     isDisposed,
     getOrCreateConnection,
+    releaseIfIdle,
   } = deps
   let subCounter = 0
   const nextSubId = (): string => `pool-${++subCounter}`
@@ -51,6 +58,7 @@ export const createSubscribe = (deps: SubscribeDeps) => {
       for (const listener of [...wireSub.listeners]) listener.onClosed?.("timeout")
       closeSubHistory({ subHistory, url, subId, clock })
       invalidateCache()
+      releaseIfIdle(url, state)
     }, pendingSubTimeoutMs)
     state.pendingSubTimeouts.set(subId, timeoutId)
   }
@@ -108,33 +116,32 @@ export const createSubscribe = (deps: SubscribeDeps) => {
     invalidateCache()
 
     const unsubscribe = (): void => {
-      const currentState = connections.get(url)
-      if (!currentState) {
-        invalidateCache()
-        return
-      }
-      const currentWireSub = findWireSub(currentState, subId)
-      if (!currentWireSub) {
-        invalidateCache()
-        return
-      }
-      currentWireSub.listeners.delete(listener)
-      if (currentWireSub.listeners.size > 0) {
+      // Operate on the closure's wireSub, not a fresh lookup: it is the same object wherever it
+      // currently lives (live state, or parked on a pending reconnect), so the listener removal
+      // sticks even while the relay's socket is down.
+      wireSub.listeners.delete(listener)
+      if (wireSub.listeners.size > 0) {
         invalidateCache()
         return
       }
 
-      const wasPending = currentState.pendingSubs.has(subId) || currentState.pendingAuthSubs.has(subId)
-      currentState.subs.delete(subId)
-      currentState.pendingSubs.delete(subId)
-      currentState.pendingAuthSubs.delete(subId)
-      currentState.subIdByFilterHash.delete(currentWireSub.filterHash)
-      clearTimerEntry(scheduler, currentState.pendingSubTimeouts, subId)
-      // A live (non-pending) sub needs a CLOSE on the wire. sendOnWebSocket is the single send
-      // primitive and no-ops unless the socket is open, so there is nothing to pre-check here.
-      const currentWs = currentState.ws
-      if (!wasPending && currentWs !== null) {
-        sendOnWebSocket(currentWs, serialiseCloseMessage(subId))
+      const owningState = findOwningState(url, subId)
+      if (owningState && findWireSub(owningState, subId) === wireSub) {
+        const wasPending = owningState.pendingSubs.has(subId) || owningState.pendingAuthSubs.has(subId)
+        owningState.subs.delete(subId)
+        owningState.pendingSubs.delete(subId)
+        owningState.pendingAuthSubs.delete(subId)
+        if (owningState.subIdByFilterHash.get(wireSub.filterHash) === subId) {
+          owningState.subIdByFilterHash.delete(wireSub.filterHash)
+        }
+        clearTimerEntry(scheduler, owningState.pendingSubTimeouts, subId)
+        // A live (non-pending) sub needs a CLOSE on the wire. sendOnWebSocket is the single send
+        // primitive and no-ops unless the socket is open, so there is nothing to pre-check here.
+        const currentWs = owningState.ws
+        if (!wasPending && currentWs !== null) {
+          sendOnWebSocket(currentWs, serialiseCloseMessage(subId))
+        }
+        releaseIfIdle(url, owningState)
       }
       closeSubHistory({ subHistory, url, subId, clock })
       invalidateCache()

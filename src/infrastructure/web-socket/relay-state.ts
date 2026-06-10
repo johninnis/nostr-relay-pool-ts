@@ -5,7 +5,7 @@ import type { Scheduler, TimerHandle } from "../../application/port/scheduler.ts
 import { closeSubHistory, type SubHistoryMap } from "../../application/service/relay-history.ts"
 import type { PublishResponse } from "../../domain/value-object/publish-history.ts"
 import type { WireSub } from "./wire-sub.ts"
-import { clearAllTimers, sendOnWebSocket } from "./web-socket-helpers.ts"
+import { clearAllTimers, closeWebSocket, sendOnWebSocket } from "./web-socket-helpers.ts"
 
 /** Internal publish-resolver shape — the per-relay `OK` reply, without the `from` URL the pool adds. */
 export type PublishAck = Omit<PublishResponse, "from">
@@ -35,6 +35,7 @@ export interface RelayState {
   authingChallenge: string | null
   connectedAt: number | null
   stabilityTimer: TimerHandle | null
+  idleTimer: TimerHandle | null
   pendingAuthPublish: Array<NostrEvent>
   pendingAuthSubs: Map<string, WireSub>
   inFlightPublishes: Map<string, InFlightPublish>
@@ -51,6 +52,7 @@ export const createRelayState = (): RelayState => ({
   authingChallenge: null,
   connectedAt: null,
   stabilityTimer: null,
+  idleTimer: null,
   pendingAuthPublish: [],
   pendingAuthSubs: new Map(),
   inFlightPublishes: new Map(),
@@ -102,6 +104,23 @@ export const promoteAuthedSubs = (state: RelayState, clock: WallClock): void => 
 
 export const hasAnySubs = (state: RelayState): boolean =>
   state.subs.size > 0 || state.pendingAuthSubs.size > 0 || state.pendingSubs.size > 0
+
+/**
+ * True when the relay has no remaining activity of any kind — no subscription (live, pending, or
+ * auth-parked) and no publish awaiting its ack. The single definition of "this socket serves no
+ * caller", consulted both when scheduling an idle close and again when its timer fires.
+ */
+export const isIdle = (state: RelayState): boolean =>
+  !hasAnySubs(state) && state.inFlightPublishes.size === 0 && state.pendingAuthPublish.length === 0
+
+/**
+ * Close a socket the pool itself is taking down. Flagging the close as intentional stops the
+ * relay's onclose handler from treating it as a failure (which would trigger backoff/reconnect).
+ */
+export const closeIntentionally = (state: RelayState): void => {
+  state.intentionalClose = true
+  if (state.ws) closeWebSocket(state.ws)
+}
 
 export interface TearDownSubsInput {
   readonly state: RelayState

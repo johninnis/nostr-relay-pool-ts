@@ -39,6 +39,7 @@ const publishWith = (state: RelayState, time: ManualTime, publishTimeoutMs: numb
     invalidateCache: (): void => {},
     onPublishInitiated: (): void => {},
     getOrCreateConnection: (): RelayState => state,
+    releaseIfIdle: (): void => {},
   })
 
 Deno.test("publish - resolves with the relay OK ack", async () => {

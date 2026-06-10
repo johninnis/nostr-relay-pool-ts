@@ -27,6 +27,7 @@ const pool = createRelayPool({
   publishTimeoutMs?: number,                // default: 8 000
   pendingSubTimeoutMs?: number,             // default: 30 000
   stableConnectionMs?: number,              // default: 30 000
+  idleSocketTimeoutMs?: number,             // default: 30 000
   relayConnectionHardTimeoutMs?: number,    // default: 12 000
 })
 ```
@@ -80,10 +81,11 @@ The package exposes these interfaces from `application/port/` so consumers and a
 
 1. `pool.subscribe(url, ...)` opens a WebSocket if one isn't already open.
 2. The pool tracks each relay's connection and auth state, plus a stability timer (default 30 s) that fires `backoff.recordSuccess(url)` once the connection has held — so a flapping relay never gets its backoff schedule reset. A relay that dropped while it still had subscriptions is surfaced as `reconnecting` in `getRelayPoolState()` until its scheduled reconnect fires.
-3. On disconnect, the pool reconnects with exponential backoff.
-4. NIP-42 AUTH challenges are queued: subscriptions and publishes wait for AUTH to complete. The pool calls `onAuthChallenge(url, challenge)`; the application returns a signed kind-22242 event or `null`.
-5. Publish results: relays that reply with an `OK` ack within `publishTimeoutMs` resolve the publish; otherwise it times out. A publish still awaiting its ack when the socket drops settles immediately as `{ ok: false, message: "disconnected" }` rather than waiting out the timeout — the event is not re-sent on reconnect.
-6. EOSE timeouts are *adaptive* per relay — `suggestedTimeout(url)` reflects what the latency tracker has learned.
+3. On disconnect, the pool reconnects with exponential backoff. The reconnect lives only as long as its subscriptions do: unsubscribing the last one during the backoff window cancels it.
+4. A socket left with no subscriptions and no in-flight publishes closes after `idleSocketTimeoutMs` (default 30 s); any new subscribe or publish within the window disarms the close. A close the pool initiates is not a relay failure, so it records no backoff penalty.
+5. NIP-42 AUTH challenges are queued: subscriptions and publishes wait for AUTH to complete. The pool calls `onAuthChallenge(url, challenge)`; the application returns a signed kind-22242 event or `null`.
+6. Publish results: relays that reply with an `OK` ack within `publishTimeoutMs` resolve the publish; otherwise it times out. A publish still awaiting its ack when the socket drops settles immediately as `{ ok: false, message: "disconnected" }` rather than waiting out the timeout — the event is not re-sent on reconnect.
+7. EOSE timeouts are *adaptive* per relay — `suggestedTimeout(url)` reflects what the latency tracker has learned.
 
 ## Disposal
 
@@ -93,7 +95,7 @@ const pool = createRelayPool()
 pool.dispose()
 ```
 
-`dispose()` closes every socket, cancels every pending timer (stability, publish, sub, reconnect), drops every connection-change listener, and switches the pool into a state where `subscribe` returns an inactive subscription and `publish` resolves with `{ ok: false, message: "disposed" }`. Idempotent. Tests and short-lived hosts should always call it.
+`dispose()` closes every socket, cancels every pending timer (stability, idle, publish, sub, reconnect), drops every connection-change listener, and switches the pool into a state where `subscribe` returns an inactive subscription and `publish` resolves with `{ ok: false, message: "disposed" }`. Idempotent. Tests and short-lived hosts should always call it.
 
 ## Anti-patterns
 

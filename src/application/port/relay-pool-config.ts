@@ -25,6 +25,8 @@ export interface RelayPoolConfig {
   readonly pendingSubTimeoutMs?: number
   /** How long a connection must stay open before its backoff step resets (ms). Default: 30000. */
   readonly stableConnectionMs?: number
+  /** How long a socket with no subscriptions or in-flight publishes stays open before the pool closes it (ms). Default: 30000. */
+  readonly idleSocketTimeoutMs?: number
   /** Upper bound on a `subscribeMany` leg's wait for EOSE before forced teardown (ms). Default: 12000. */
   readonly relayConnectionHardTimeoutMs?: number
 }

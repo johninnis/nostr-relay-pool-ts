@@ -17,10 +17,11 @@ const subscribeWith = (state: RelayState, time: ReturnType<typeof createManualTi
     scheduler: time.scheduler,
     pendingSubTimeoutMs: PENDING_SUB_TIMEOUT_MS,
     subHistory,
-    connections: new Map([[URL, state]]),
+    findOwningState: (): RelayState => state,
     invalidateCache: (): void => {},
     isDisposed: (): boolean => false,
     getOrCreateConnection: (): RelayState => state,
+    releaseIfIdle: (): void => {},
   })
 }
 

@@ -133,6 +133,107 @@ Deno.test("disconnect - cancels a pending reconnect so the relay is not revived"
   }
 })
 
+Deno.test("unsubscribe - during a reconnect window removes the sub so the reconnect cannot resurrect it", async () => {
+  const relay = createInMemoryRelay()
+  await relay.start()
+  const pool = createRelayPool()
+  try {
+    const received: Array<string> = []
+    const handle = pool.subscribe(relay.url, [{ kinds: [1] }], { onEvent: (e) => received.push(e.id) })
+    await delay(200)
+
+    // Drop the socket (network cut): the pool parks the sub and queues a reconnect in ~500ms.
+    relay.dropConnections()
+    await delay(100)
+    // Unsubscribe inside the backoff window, while no live connection exists for the relay.
+    handle.unsubscribe()
+
+    // Past the window: a sub left parked would have been re-issued by the reconnect and would
+    // receive this event as an unowned REQ that nothing can ever close.
+    await delay(700)
+    relay.inject(buildEventFixture({ kind: 1 }))
+    await delay(200)
+
+    assertEquals(received.length, 0)
+    assertEquals(pool.getConnectedRelayUrls().length, 0)
+  } finally {
+    pool.dispose()
+    await relay.stop()
+  }
+})
+
+Deno.test("idle socket - closes after the last unsubscribe without a backoff penalty", async () => {
+  const relay = createInMemoryRelay()
+  await relay.start()
+  const time = createManualTime()
+  const pool = createRelayPool({ clock: time.clock, scheduler: time.scheduler })
+  try {
+    const handle = pool.subscribe(relay.url, [{ kinds: [1] }], { onEvent: () => {} })
+    await delay(200)
+    assertEquals(pool.getConnectedRelayUrls(), [relay.url])
+
+    handle.unsubscribe()
+    time.tick(30_000)
+    await delay(100)
+
+    assertEquals(pool.getConnectedRelayUrls().length, 0)
+    // An idle close is pool-initiated, not a relay failure: it must not start a cooldown.
+    const entry = pool.getRelayPoolState().find((e) => e.url === relay.url)
+    assertEquals(entry?.disabledUntil ?? null, null)
+  } finally {
+    pool.dispose()
+    await relay.stop()
+  }
+})
+
+Deno.test("idle socket - new activity before the idle timeout keeps the socket open", async () => {
+  const relay = createInMemoryRelay()
+  await relay.start()
+  const time = createManualTime()
+  const pool = createRelayPool({ clock: time.clock, scheduler: time.scheduler })
+  try {
+    const first = pool.subscribe(relay.url, [{ kinds: [1] }], { onEvent: () => {} })
+    await delay(200)
+    first.unsubscribe()
+
+    const received: Array<string> = []
+    pool.subscribe(relay.url, [{ kinds: [1] }], { onEvent: (e) => received.push(e.id) })
+    await delay(100)
+    time.tick(30_000)
+    await delay(100)
+
+    assertEquals(pool.getConnectedRelayUrls(), [relay.url])
+    relay.inject(buildEventFixture({ kind: 1 }))
+    await delay(200)
+    assertEquals(received.length, 1)
+  } finally {
+    pool.dispose()
+    await relay.stop()
+  }
+})
+
+Deno.test("idle socket - a publish-only socket closes after the idle timeout", async () => {
+  const relay = createInMemoryRelay()
+  await relay.start()
+  const time = createManualTime()
+  const pool = createRelayPool({ clock: time.clock, scheduler: time.scheduler })
+  try {
+    const result = await pool.publish(relay.url, buildEventFixture({ kind: 1 }))
+    assertEquals(result.ok, true)
+    assertEquals(pool.getConnectedRelayUrls(), [relay.url])
+
+    time.tick(30_000)
+    await delay(100)
+
+    assertEquals(pool.getConnectedRelayUrls().length, 0)
+    const entry = pool.getRelayPoolState().find((e) => e.url === relay.url)
+    assertEquals(entry?.disabledUntil ?? null, null)
+  } finally {
+    pool.dispose()
+    await relay.stop()
+  }
+})
+
 Deno.test("dispose - settles an in-flight publish instead of leaving the promise hanging", async () => {
   const relay = createInMemoryRelay()
   await relay.start()

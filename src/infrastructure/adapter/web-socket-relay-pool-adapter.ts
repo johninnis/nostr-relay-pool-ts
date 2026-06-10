@@ -24,7 +24,7 @@ import type { RelaySubscribeCallbacks, Subscription } from "../../domain/value-o
 import { createPublish } from "../web-socket/publish.ts"
 import { createSubscribe, INACTIVE_SUBSCRIPTION } from "../web-socket/subscribe.ts"
 import { createSocketManager, type PendingReconnect } from "../web-socket/socket-manager.ts"
-import { tearDownSubs } from "../web-socket/relay-state.ts"
+import { closeIntentionally, findWireSub, tearDownSubs } from "../web-socket/relay-state.ts"
 import type { RelayState } from "../web-socket/relay-state.ts"
 import {
   buildPoolState,
@@ -33,9 +33,10 @@ import {
   type PoolSnapshot,
 } from "../web-socket/pool-state-projection.ts"
 import type { MessageContext } from "../web-socket/relay-message-handler.ts"
-import { closeWebSocket, isOpen } from "../web-socket/web-socket-helpers.ts"
+import { isOpen } from "../web-socket/web-socket-helpers.ts"
 
 const DEFAULT_STABLE_CONNECTION_MS = 30_000
+const DEFAULT_IDLE_SOCKET_TIMEOUT_MS = 30_000
 const DEFAULT_PUBLISH_TIMEOUT_MS = 8_000
 const DEFAULT_PENDING_SUB_TIMEOUT_MS = 30_000
 const DEFAULT_RELAY_CONNECTION_HARD_TIMEOUT_MS = 12_000
@@ -50,6 +51,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   const clock: WallClock = config.clock ?? systemWallClock
   const scheduler: Scheduler = config.scheduler ?? systemScheduler
   const stableConnectionMs = config.stableConnectionMs ?? DEFAULT_STABLE_CONNECTION_MS
+  const idleSocketTimeoutMs = config.idleSocketTimeoutMs ?? DEFAULT_IDLE_SOCKET_TIMEOUT_MS
   const publishTimeoutMs = config.publishTimeoutMs ?? DEFAULT_PUBLISH_TIMEOUT_MS
   const pendingSubTimeoutMs = config.pendingSubTimeoutMs ?? DEFAULT_PENDING_SUB_TIMEOUT_MS
   const relayConnectionHardTimeoutMs = config.relayConnectionHardTimeoutMs ??
@@ -120,6 +122,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     scheduler,
     backoff,
     stableConnectionMs,
+    idleSocketTimeoutMs,
     connections,
     pendingReconnects,
     attemptedRelays,
@@ -129,15 +132,27 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     buildMessageContext,
   })
 
+  // The state owning a sub is usually the live connection, but a relay that dropped mid-sub parks
+  // its state on the pending reconnect — and a fresh subscribe during the backoff window can put a
+  // new live state alongside it, so ownership is decided by which state actually holds the subId.
+  const findOwningState = (url: RelayUrl, subId: string): RelayState | undefined => {
+    const live = connections.get(url)
+    if (live && findWireSub(live, subId)) return live
+    const parked = pendingReconnects.get(url)?.state
+    if (parked && findWireSub(parked, subId)) return parked
+    return undefined
+  }
+
   const subscribe = createSubscribe({
     clock,
     scheduler,
     pendingSubTimeoutMs,
     subHistory,
-    connections,
+    findOwningState,
     invalidateCache,
     isDisposed: () => disposed,
     getOrCreateConnection: socketManager.getOrCreateConnection,
+    releaseIfIdle: socketManager.releaseIfIdle,
   })
 
   const publish = createPublish({
@@ -148,6 +163,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     invalidateCache,
     onPublishInitiated: incrementPublishCount,
     getOrCreateConnection: socketManager.getOrCreateConnection,
+    releaseIfIdle: socketManager.releaseIfIdle,
   })
 
   // Public boundary: normalise the raw URL once, then hand the branded RelayUrl to the core
@@ -239,13 +255,6 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   const tearDownStateSubs = (url: RelayUrl, state: RelayState, reason: string): void =>
     tearDownSubs({ state, url, subHistory, clock, scheduler, reason })
 
-  // Close a socket the pool itself is taking down. Flagging the close as intentional stops the
-  // relay's onclose handler from treating it as a failure (which would trigger backoff/reconnect).
-  const closeIntentionally = (state: RelayState): void => {
-    state.intentionalClose = true
-    if (state.ws) closeWebSocket(state.ws)
-  }
-
   // Settle every publish still awaiting an ack on a socket the pool is taking down. Each settle clears
   // its own timeout and drops its in-flight record, so the relay's onclose finds an empty queue. Every
   // teardown path (dispose, disconnect, gate-reject) pre-settles here rather than leaning on the async
@@ -254,21 +263,13 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     for (const inFlight of [...state.inFlightPublishes.values()]) inFlight.settle({ ok: false, message })
   }
 
-  const cancelPendingReconnect = (url: RelayUrl): void => {
-    const scheduledReconnect = pendingReconnects.get(url)
-    if (!scheduledReconnect) return
-    scheduledReconnect.cancel()
-    pendingReconnects.delete(url)
-    invalidateCache()
-  }
-
   const disconnect = (rawUrl: string): void => {
     const url = normaliseRelayUrl(rawUrl)
     if (!url) return
     // A relay that dropped while it still had subscriptions sits in pendingReconnects with no live
     // socket; without cancelling that timer the pool would silently revive a relay the caller just
     // asked to disconnect.
-    cancelPendingReconnect(url)
+    socketManager.cancelPendingReconnect(url)
     const state = connections.get(url)
     if (!state) return
     tearDownStateSubs(url, state, "disconnected")
@@ -288,7 +289,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     // so the loop above misses it. Cancel any queued reconnect the new gate now rejects — otherwise
     // it would keep reporting `reconnecting` until the timer fired into a gate-blocked no-op.
     for (const url of [...pendingReconnects.keys()]) {
-      if (!gate(url)) cancelPendingReconnect(url)
+      if (!gate(url)) socketManager.cancelPendingReconnect(url)
     }
     invalidateCache()
   }
@@ -337,6 +338,10 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
       if (state.stabilityTimer !== null) {
         scheduler.clearTimer(state.stabilityTimer)
         state.stabilityTimer = null
+      }
+      if (state.idleTimer !== null) {
+        scheduler.clearTimer(state.idleTimer)
+        state.idleTimer = null
       }
       settleInFlightPublishes(state, "disposed")
       closeIntentionally(state)

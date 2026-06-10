@@ -4,11 +4,25 @@ import type { BackoffTracker } from "../../application/service/backoff-tracker.t
 import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler } from "../../application/port/scheduler.ts"
 import type { RelayState } from "./relay-state.ts"
-import { createRelayState, hasAnySubs, promoteAuthedSubs, reissueReq, transferPendingState } from "./relay-state.ts"
+import {
+  closeIntentionally,
+  createRelayState,
+  hasAnySubs,
+  isIdle,
+  promoteAuthedSubs,
+  reissueReq,
+  transferPendingState,
+} from "./relay-state.ts"
 import { handleRelayMessage, type MessageContext } from "./relay-message-handler.ts"
 import { clearAllTimers, clearTimerEntry, isOpen, isOpenOrConnecting } from "./web-socket-helpers.ts"
 
 export interface PendingReconnect {
+  /**
+   * The state the dropped socket left behind, still holding its subscriptions until the reconnect
+   * transfers them. Exposed so an unsubscribe arriving during the backoff window can remove its sub
+   * from here — otherwise the reconnect would resurrect it as a REQ no caller can ever close.
+   */
+  readonly state: RelayState
   readonly cancel: () => void
   readonly fire: () => void
 }
@@ -18,6 +32,7 @@ export interface SocketManagerDeps {
   readonly scheduler: Scheduler
   readonly backoff: BackoffTracker
   readonly stableConnectionMs: number
+  readonly idleSocketTimeoutMs: number
   readonly connections: Map<RelayUrl, RelayState>
   readonly pendingReconnects: Map<RelayUrl, PendingReconnect>
   readonly attemptedRelays: Set<RelayUrl>
@@ -29,6 +44,15 @@ export interface SocketManagerDeps {
 
 export interface SocketManager {
   readonly getOrCreateConnection: (url: RelayUrl) => RelayState | null
+  /** Cancel and discard the queued reconnect for `url`, if one exists. */
+  readonly cancelPendingReconnect: (url: RelayUrl) => void
+  /**
+   * Reconsider whether `state` still needs to exist, after a caller removed its last known piece of
+   * activity. An idle state parked on a pending reconnect has its reconnect cancelled outright; an
+   * idle live socket gets an idle timer that closes it intentionally (no backoff penalty) unless new
+   * activity arrives first. Non-idle states are left untouched.
+   */
+  readonly releaseIfIdle: (url: RelayUrl, state: RelayState) => void
 }
 
 const reopenSubs = (scheduler: Scheduler, clock: WallClock, state: RelayState): void => {
@@ -55,6 +79,7 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
     scheduler,
     backoff,
     stableConnectionMs,
+    idleSocketTimeoutMs,
     connections,
     pendingReconnects,
     attemptedRelays,
@@ -88,12 +113,37 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
     }
     const timerId = scheduler.setTimer(fire, delayMs)
     pendingReconnects.set(url, {
+      state: oldState,
       cancel: () => scheduler.clearTimer(timerId),
       fire: () => {
         scheduler.clearTimer(timerId)
         fire()
       },
     })
+  }
+
+  const cancelPendingReconnect = (url: RelayUrl): void => {
+    const scheduledReconnect = pendingReconnects.get(url)
+    if (!scheduledReconnect) return
+    scheduledReconnect.cancel()
+    pendingReconnects.delete(url)
+    invalidateCache()
+  }
+
+  const releaseIfIdle = (url: RelayUrl, state: RelayState): void => {
+    if (!isIdle(state)) return
+    if (pendingReconnects.get(url)?.state === state) {
+      cancelPendingReconnect(url)
+      return
+    }
+    if (connections.get(url) !== state) return
+    if (state.idleTimer !== null) scheduler.clearTimer(state.idleTimer)
+    state.idleTimer = scheduler.setTimer(() => {
+      state.idleTimer = null
+      // Re-check at fire time: activity that arrived through a path that did not clear the timer
+      // (e.g. a publish settled and re-queued within the window) must keep the socket alive.
+      if (isIdle(state)) closeIntentionally(state)
+    }, idleSocketTimeoutMs)
   }
 
   const attachSocket = (state: RelayState, ws: WebSocket, url: RelayUrl): void => {
@@ -115,6 +165,10 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
       if (state.stabilityTimer !== null) {
         scheduler.clearTimer(state.stabilityTimer)
         state.stabilityTimer = null
+      }
+      if (state.idleTimer !== null) {
+        scheduler.clearTimer(state.idleTimer)
+        state.idleTimer = null
       }
       // The pending-sub watchdogs belong to this now-dead socket. Left armed they would fire against
       // the shared subscription history and prematurely close a sub the reconnect re-establishes; a
@@ -153,7 +207,15 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
     if (backoff.isDisabled(url)) return null
 
     const existing = connections.get(url)
-    if (existing && isOpenOrConnecting(existing.ws)) return existing
+    if (existing && isOpenOrConnecting(existing.ws)) {
+      // New activity on a socket awaiting its idle close: the reuse path is the one funnel every
+      // subscribe and publish passes through, so disarming here keeps the socket alive for it.
+      if (existing.idleTimer !== null) {
+        scheduler.clearTimer(existing.idleTimer)
+        existing.idleTimer = null
+      }
+      return existing
+    }
 
     const state = createRelayState()
 
@@ -171,5 +233,5 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
     return state
   }
 
-  return Object.freeze({ getOrCreateConnection })
+  return Object.freeze({ getOrCreateConnection, cancelPendingReconnect, releaseIfIdle })
 }

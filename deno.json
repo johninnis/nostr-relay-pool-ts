@@ -1,6 +1,6 @@
 {
   "name": "@innis/nostr-relay-pool",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "description": "TypeScript Nostr relay pool: WebSocket subscriptions, publishes, NIP-42 AUTH, exponential backoff, and latency tracking.",
   "exports": {
