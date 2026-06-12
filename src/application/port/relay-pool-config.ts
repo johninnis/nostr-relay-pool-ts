@@ -29,4 +29,12 @@ export interface RelayPoolConfig {
   readonly idleSocketTimeoutMs?: number
   /** Upper bound on a `subscribeMany` leg's wait for EOSE before forced teardown (ms). Default: 12000. */
   readonly relayConnectionHardTimeoutMs?: number
+  /**
+   * How long the NIP-42 {@link AuthHandler} may take to produce a signed AUTH event before the
+   * challenge is abandoned (ms). Generous by default because auth handlers often have a human in
+   * the loop (a NIP-07 prompt, a remote NIP-46 approval); the bound exists so a hung handler can
+   * never strand auth-parked subscriptions indefinitely — the relay's next challenge retries.
+   * Default: 60000.
+   */
+  readonly authTimeoutMs?: number
 }

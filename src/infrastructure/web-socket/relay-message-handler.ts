@@ -2,7 +2,7 @@ import type { NostrEvent, RelayUrl } from "@innis/nostr-core"
 import { parseRelayMessage, reportUnhandledError, serialiseAuthMessage, serialiseEventMessage } from "@innis/nostr-core"
 import type { AuthHandler } from "../../application/port/auth-handler.ts"
 import type { WallClock } from "../../application/port/clock.ts"
-import type { Scheduler } from "../../application/port/scheduler.ts"
+import type { Scheduler, TimerHandle } from "../../application/port/scheduler.ts"
 import { closeSubHistory, type SubHistoryRecord } from "../../application/service/relay-history.ts"
 import type { PublishAck, RelayState } from "./relay-state.ts"
 import { promoteAuthedSubs } from "./relay-state.ts"
@@ -13,6 +13,7 @@ export interface MessageContext {
   readonly url: RelayUrl
   readonly subHistory: ReadonlyMap<RelayUrl, Map<string, SubHistoryRecord>>
   readonly authHandler: () => AuthHandler | null
+  readonly authTimeoutMs: number
   readonly clock: WallClock
   readonly scheduler: Scheduler
   readonly onEventReceived: (url: RelayUrl) => void
@@ -36,8 +37,21 @@ const handleAuthChallenge = async (ctx: MessageContext, challenge: string): Prom
   const handler = ctx.authHandler()
   if (!handler || !ctx.state.ws) return
   ctx.state.authingChallenge = challenge
+  let timer: TimerHandle | undefined
   try {
-    const signed = await handler(ctx.url, challenge)
+    const handlerPromise = handler(ctx.url, challenge)
+    // A rejection arriving after the timeout has already settled the race must not surface as a
+    // second unhandled rejection; a pre-timeout rejection still propagates through the race.
+    handlerPromise.catch(() => {})
+    const signed = await Promise.race([
+      handlerPromise,
+      new Promise<never>((_, reject) => {
+        timer = ctx.scheduler.setTimer(
+          () => reject(new Error(`NIP-42 auth handler timed out after ${ctx.authTimeoutMs} ms`)),
+          ctx.authTimeoutMs,
+        )
+      }),
+    ])
     if (!signed || !ctx.state.ws) return
     // Optimistic by necessity: NIP-42 makes the relay's OK for the AUTH event optional, and many
     // relays simply start honouring requests once AUTH is sent. So flush the parked queue now. If
@@ -53,6 +67,7 @@ const handleAuthChallenge = async (ctx: MessageContext, challenge: string): Prom
     ctx.state.authed = false
     reportUnhandledError(err)
   } finally {
+    if (timer !== undefined) ctx.scheduler.clearTimer(timer)
     ctx.state.authingChallenge = null
   }
 }

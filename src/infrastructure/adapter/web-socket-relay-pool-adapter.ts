@@ -40,6 +40,7 @@ const DEFAULT_IDLE_SOCKET_TIMEOUT_MS = 30_000
 const DEFAULT_PUBLISH_TIMEOUT_MS = 8_000
 const DEFAULT_PENDING_SUB_TIMEOUT_MS = 30_000
 const DEFAULT_RELAY_CONNECTION_HARD_TIMEOUT_MS = 12_000
+const DEFAULT_AUTH_TIMEOUT_MS = 60_000
 
 /**
  * Construct a {@link RelayPool} backed by the host's `WebSocket`. The sole entry point of the
@@ -56,6 +57,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   const pendingSubTimeoutMs = config.pendingSubTimeoutMs ?? DEFAULT_PENDING_SUB_TIMEOUT_MS
   const relayConnectionHardTimeoutMs = config.relayConnectionHardTimeoutMs ??
     DEFAULT_RELAY_CONNECTION_HARD_TIMEOUT_MS
+  const authTimeoutMs = config.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS
 
   const connections = new Map<RelayUrl, RelayState>()
   const relayEventCounts = new Map<RelayUrl, number>()
@@ -110,6 +112,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     url,
     subHistory,
     authHandler: () => authHandler,
+    authTimeoutMs,
     clock,
     scheduler,
     onEventReceived: incrementEventCount,
