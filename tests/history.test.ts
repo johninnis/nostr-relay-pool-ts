@@ -109,7 +109,7 @@ Deno.test("tearDownSubs - fires the terminal onClosed (not onEose) for active li
     "s1",
     stubWireSub({
       filterHash: "h",
-      listeners: new Set([{
+      listeners: [{
         onEvent: () => {},
         onEose: () => {
           eoseCalls++
@@ -117,7 +117,7 @@ Deno.test("tearDownSubs - fires the terminal onClosed (not onEose) for active li
         onClosed: (reason) => {
           closedReasons.push(reason)
         },
-      }]),
+      }],
     }),
   )
   tearDownSubs({

@@ -1,5 +1,5 @@
 import type { NostrFilter, RelayUrl } from "@innis/nostr-core"
-import { hashFilters, serialiseCloseMessage } from "@innis/nostr-core"
+import { compileFilters, hashFilters, serialiseCloseMessage } from "@innis/nostr-core"
 import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler } from "../../application/port/scheduler.ts"
 import { closeSubHistory, recordSubHistory, type SubHistoryMap } from "../../application/service/relay-history.ts"
@@ -55,7 +55,7 @@ export const createSubscribe = (deps: SubscribeDeps) => {
       // The socket never opened in time, so this sub is dropped from pendingSubs and will not be
       // re-issued — it is dead and will not revive. Fire the terminal onClosed, as every other
       // death path does, rather than leaving the subscriber with no signal.
-      for (const listener of [...wireSub.listeners]) listener.onClosed?.("timeout")
+      for (const listener of wireSub.listeners) listener.onClosed?.("timeout")
       closeSubHistory({ subHistory, url, subId, clock })
       invalidateCache()
       releaseIfIdle(url, state)
@@ -88,17 +88,24 @@ export const createSubscribe = (deps: SubscribeDeps) => {
     if (existingWireSub && existingSubId !== undefined) {
       subId = existingSubId
       wireSub = existingWireSub
-      wireSub.listeners.add(listener)
+      wireSub.listeners = [...wireSub.listeners, listener]
       // Synthetic catch-up EOSE for a late joiner. Re-check membership on the microtask: a caller
-      // that unsubscribes synchronously has already left the listener set and must not be signalled.
+      // that unsubscribes synchronously has already left the listener array and must not be signalled.
       if (wireSub.eoseFired) {
         queueMicrotask(() => {
-          if (wireSub.listeners.has(listener)) listener.onEose?.()
+          if (wireSub.listeners.includes(listener)) listener.onEose?.()
         })
       }
     } else {
       subId = nextSubId()
-      wireSub = { filters, filterHash, listeners: new Set([listener]), eoseFired: false, reqSentAt: 0 }
+      wireSub = {
+        filters,
+        filterHash,
+        compiled: compileFilters(filters),
+        listeners: [listener],
+        eoseFired: false,
+        reqSentAt: 0,
+      }
       state.subIdByFilterHash.set(filterHash, subId)
 
       const ws = state.ws
@@ -119,8 +126,8 @@ export const createSubscribe = (deps: SubscribeDeps) => {
       // Operate on the closure's wireSub, not a fresh lookup: it is the same object wherever it
       // currently lives (live state, or parked on a pending reconnect), so the listener removal
       // sticks even while the relay's socket is down.
-      wireSub.listeners.delete(listener)
-      if (wireSub.listeners.size > 0) {
+      wireSub.listeners = wireSub.listeners.filter((l) => l !== listener)
+      if (wireSub.listeners.length > 0) {
         invalidateCache()
         return
       }

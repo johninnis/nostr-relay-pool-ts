@@ -58,11 +58,11 @@ Deno.test("handleRelayMessage - delivers a matching EVENT to subscription listen
   state.subs.set(
     "sub-1",
     wireSubWith(
-      new Set([{
+      [{
         onEvent: (e) => {
           received.push(e)
         },
-      }]),
+      }],
     ),
   )
   handleRelayMessage(context(state), message(["EVENT", "sub-1", event()]))
@@ -75,11 +75,11 @@ Deno.test("handleRelayMessage - drops an EVENT that does not match the filter", 
   state.subs.set(
     "sub-1",
     wireSubWith(
-      new Set([{
+      [{
         onEvent: (e) => {
           received.push(e)
         },
-      }]),
+      }],
     ),
   )
   handleRelayMessage(context(state), message(["EVENT", "sub-1", event({ kind: 7 })]))
@@ -104,12 +104,12 @@ Deno.test("handleRelayMessage - fires onEose once for an EOSE message", () => {
   let eoseCalls = 0
   const state = stubRelayState()
   const sub = wireSubWith(
-    new Set([{
+    [{
       onEvent: () => {},
       onEose: () => {
         eoseCalls++
       },
-    }]),
+    }],
   )
   state.subs.set("sub-1", sub)
   const ctx = context(state)
@@ -174,7 +174,7 @@ Deno.test("handleRelayMessage - removes a subscription on a CLOSED message", () 
 Deno.test("handleRelayMessage - fires onClosed with the reason on a non-auth CLOSED", () => {
   const reasons: string[] = []
   const state = stubRelayState()
-  const sub = wireSubWith(new Set([{ onEvent: () => {}, onClosed: (reason) => reasons.push(reason) }]))
+  const sub = wireSubWith([{ onEvent: () => {}, onClosed: (reason) => reasons.push(reason) }])
   state.subs.set("sub-1", sub)
   handleRelayMessage(context(state), message(["CLOSED", "sub-1", "rate-limited: slow down"]))
   assertEquals(reasons, ["rate-limited: slow down"])
@@ -185,7 +185,7 @@ Deno.test("handleRelayMessage - a non-auth CLOSED does not fire onEose", () => {
   let eoseCalls = 0
   let closedCalls = 0
   const state = stubRelayState()
-  const sub = wireSubWith(new Set([{ onEvent: () => {}, onEose: () => eoseCalls++, onClosed: () => closedCalls++ }]))
+  const sub = wireSubWith([{ onEvent: () => {}, onEose: () => eoseCalls++, onClosed: () => closedCalls++ }])
   state.subs.set("sub-1", sub)
   handleRelayMessage(context(state), message(["CLOSED", "sub-1", "shutting down"]))
   assertEquals(eoseCalls, 0)
@@ -196,7 +196,7 @@ Deno.test("handleRelayMessage - an auth-required CLOSED fires neither onEose nor
   let eoseCalls = 0
   let closedCalls = 0
   const state = stubRelayState()
-  const sub = wireSubWith(new Set([{ onEvent: () => {}, onEose: () => eoseCalls++, onClosed: () => closedCalls++ }]))
+  const sub = wireSubWith([{ onEvent: () => {}, onEose: () => eoseCalls++, onClosed: () => closedCalls++ }])
   state.subs.set("sub-1", sub)
   handleRelayMessage(context(state), message(["CLOSED", "sub-1", "auth-required: restricted"]))
   assertEquals(eoseCalls, 0)
@@ -223,7 +223,7 @@ Deno.test("handleRelayMessage - an auth-required CLOSED clears authed so a re-ch
 
 Deno.test("handleRelayMessage - increments the event count in subscription history", () => {
   const state = stubRelayState()
-  state.subs.set("sub-1", stubWireSub({ listeners: new Set([{ onEvent: () => {} }]) }))
+  state.subs.set("sub-1", stubWireSub({ listeners: [{ onEvent: () => {} }] }))
   const entry: SubHistoryRecord = {
     subId: "sub-1",
     filters: [{ kinds: [1] }],

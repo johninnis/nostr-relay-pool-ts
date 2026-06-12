@@ -1,4 +1,4 @@
-import type { NostrEvent } from "@innis/nostr-core"
+import { compileFilters, type NostrEvent, type NostrFilter } from "@innis/nostr-core"
 import {
   createRelayState,
   type InFlightPublish,
@@ -25,11 +25,15 @@ export const stubInFlightPublish = (event: NostrEvent, overrides: Partial<InFlig
   }
 }
 
-export const stubWireSub = (overrides: Partial<WireSub> = {}): WireSub => ({
-  filters: [{ kinds: [1] }],
-  filterHash: "hash",
-  listeners: new Set(),
-  eoseFired: false,
-  reqSentAt: 0,
-  ...overrides,
-})
+export const stubWireSub = (overrides: Partial<WireSub> = {}): WireSub => {
+  const filters: ReadonlyArray<NostrFilter> = overrides.filters ?? [{ kinds: [1] }]
+  return {
+    filters,
+    filterHash: "hash",
+    compiled: compileFilters(filters),
+    listeners: [],
+    eoseFired: false,
+    reqSentAt: 0,
+    ...overrides,
+  }
+}

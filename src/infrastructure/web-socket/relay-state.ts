@@ -139,7 +139,7 @@ export interface TearDownSubsInput {
  */
 export const tearDownSubs = ({ state, url, subHistory, clock, scheduler, reason }: TearDownSubsInput): void => {
   for (const [subId, wireSub] of state.subs) {
-    for (const listener of [...wireSub.listeners]) listener.onClosed?.(reason)
+    for (const listener of wireSub.listeners) listener.onClosed?.(reason)
     closeSubHistory({ subHistory, url, subId, clock })
   }
   for (const [subId] of state.pendingSubs) closeSubHistory({ subHistory, url, subId, clock })
