@@ -23,6 +23,7 @@ const messageContext = (state: RelayState, scheduler: Scheduler) => ({
   url: URL,
   subHistory: new Map(),
   authHandler: (): null => null,
+  authTimeoutMs: 60_000,
   clock: () => 0,
   scheduler,
   onEventReceived: (): void => {},

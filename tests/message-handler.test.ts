@@ -10,6 +10,7 @@ import type { SubHistoryRecord } from "../src/application/service/relay-history.
 import type { PublishAck } from "../src/infrastructure/web-socket/relay-state.ts"
 import type { WireSub } from "../src/infrastructure/web-socket/wire-sub.ts"
 import { stubInFlightPublish, stubRelayState, stubWireSub } from "./_helpers/relay-state.ts"
+import { createManualTime } from "./_helpers/scheduler.ts"
 
 const URL = parseRelayUrl("wss://relay.example.com")
 
@@ -29,6 +30,7 @@ const context = (state: RelayState, partial: Partial<MessageContext> = {}): Mess
   url: URL,
   subHistory: new Map(),
   authHandler: () => null,
+  authTimeoutMs: 60_000,
   clock: systemWallClock,
   scheduler: systemScheduler,
   onEventReceived: () => {},
@@ -234,4 +236,72 @@ Deno.test("handleRelayMessage - increments the event count in subscription histo
   const subHistory = new Map([[URL, new Map([["sub-1", entry]])]])
   handleRelayMessage(context(state, { subHistory }), message(["EVENT", "sub-1", event()]))
   assertEquals(entry.eventCount, 1)
+})
+
+const openSocket = (sent: string[]): WebSocket =>
+  // deno-lint-ignore innis/no-type-assertions -- minimal WebSocket stand-in; only readyState and send are used.
+  ({
+    readyState: WebSocket.OPEN,
+    send: (data: string) => {
+      sent.push(data)
+    },
+  }) as unknown as WebSocket
+
+const flushMicrotasks = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+Deno.test("handleRelayMessage - abandons a hung auth handler after authTimeoutMs so a re-challenge can retry", async () => {
+  const errors: unknown[] = []
+  const onError = (e: ErrorEvent): void => {
+    e.preventDefault()
+    errors.push(e.error)
+  }
+  globalThis.addEventListener("error", onError)
+  try {
+    const time = createManualTime()
+    const state = stubRelayState({ ws: openSocket([]) })
+    let handlerCalls = 0
+    const ctx = context(state, {
+      clock: time.clock,
+      scheduler: time.scheduler,
+      authHandler: () => () => {
+        handlerCalls++
+        return new Promise<NostrEvent | null>(() => {})
+      },
+    })
+
+    handleRelayMessage(ctx, message(["AUTH", "challenge-1"]))
+    assertEquals(handlerCalls, 1)
+    assertEquals(state.authingChallenge, "challenge-1")
+
+    time.tick(60_000)
+    await flushMicrotasks()
+
+    assertEquals(state.authingChallenge, null, "the timed-out challenge must be released")
+    assertEquals(state.authed, false)
+    assertEquals(errors.length, 1, "the timeout must surface to the host process")
+
+    handleRelayMessage(ctx, message(["AUTH", "challenge-1"]))
+    assertEquals(handlerCalls, 2, "a re-challenge after the timeout must invoke the handler again")
+    await flushMicrotasks()
+  } finally {
+    globalThis.removeEventListener("error", onError)
+  }
+})
+
+Deno.test("handleRelayMessage - clears the auth timeout timer when the handler resolves in time", async () => {
+  const time = createManualTime()
+  const sent: string[] = []
+  const state = stubRelayState({ ws: openSocket(sent) })
+  const ctx = context(state, {
+    clock: time.clock,
+    scheduler: time.scheduler,
+    authHandler: () => () => Promise.resolve(event({ kind: 22242 })),
+  })
+
+  handleRelayMessage(ctx, message(["AUTH", "challenge-1"]))
+  await flushMicrotasks()
+
+  assertEquals(state.authed, true)
+  assertEquals(sent.length, 1, "the signed AUTH event must be sent")
+  assertEquals(time.pendingCount(), 0, "the timeout timer must be cleared once the handler settles")
 })
