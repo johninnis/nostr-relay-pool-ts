@@ -42,6 +42,6 @@
     "exclude": ["**/*.md"]
   },
   "publish": {
-    "exclude": ["tests/", "scripts/", "deno.lock", ".gitignore", ".claude/", ".github/"]
+    "exclude": ["tests/", "deno.lock", ".github/"]
   }
 }
