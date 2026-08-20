@@ -43,5 +43,9 @@
   },
   "publish": {
     "exclude": ["tests/", "deno.lock", ".github/"]
+  },
+  "minimumDependencyAge": {
+    "age": "PT24H",
+    "exclude": ["jsr:@innis/*"]
   }
 }
