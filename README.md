@@ -148,7 +148,4 @@ src/
                        wire-sub, web-socket-helpers)
 ```
 
-`adapter/` holds only true adapters — `createRelayPool` (the composition root that wires everything
-together) and the two system port defaults. Everything that touches a raw `WebSocket` or mutates
-relay transport state lives under `web-socket/`, regardless of whether it's a factory the adapter
-calls (`socket-manager`, `subscribe`, `publish`) or a lower-level helper.
+`adapter/` holds only true adapters — `createRelayPool` (the composition root that wires everything together) and the two system port defaults. Everything that touches a raw `WebSocket` or mutates relay transport state lives under `web-socket/`, regardless of whether it's a factory the adapter calls (`socket-manager`, `subscribe`, `publish`) or a lower-level helper.
