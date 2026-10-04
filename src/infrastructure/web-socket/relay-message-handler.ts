@@ -1,19 +1,21 @@
-import type { NostrEvent, RelayUrl } from "@innis/nostr-core"
-import { parseRelayMessage, reportUnhandledError, serialiseAuthMessage, serialiseEventMessage } from "@innis/nostr-core"
+import type { AuthChallenge, NostrEvent, RelayMessage, RelayUrl, SubscriptionId } from "@innis/nostr-core"
+import { authChallengesEqual, parseRelayMessage, serialiseAuthMessage, serialiseEventMessage } from "@innis/nostr-core"
 import type { AuthHandler } from "../../application/port/auth-handler.ts"
 import type { WallClock } from "../../application/port/clock.ts"
-import type { Scheduler, TimerHandle } from "../../application/port/scheduler.ts"
+import type { Scheduler } from "../../application/port/scheduler.ts"
 import { closeSubHistory, type SubHistoryRecord } from "../../application/service/relay-history.ts"
-import type { PublishAck, RelayState } from "./relay-state.ts"
-import { promoteAuthedSubs } from "./relay-state.ts"
-import { clearTimerEntry, sendOnWebSocket } from "./web-socket-helpers.ts"
+import type { RelayState } from "./relay-state.ts"
+import { cancelAuthTimer, cancelPendingSubTimeout, promoteAuthedSubs, releaseAuthAttempt } from "./relay-state.ts"
+import { sendKeepalive, sendOnWebSocket } from "./web-socket-helpers.ts"
+import type { WireSub } from "./wire-sub.ts"
 
 export interface MessageContext {
   readonly state: RelayState
   readonly url: RelayUrl
-  readonly subHistory: ReadonlyMap<RelayUrl, Map<string, SubHistoryRecord>>
+  readonly subHistory: ReadonlyMap<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>
   readonly authHandler: () => AuthHandler | null
   readonly authTimeoutMs: number
+  readonly maxMessageBytes: number
   readonly clock: WallClock
   readonly scheduler: Scheduler
   readonly onEventReceived: (url: RelayUrl) => void
@@ -21,58 +23,166 @@ export interface MessageContext {
   readonly onStateChange: () => void
 }
 
-const sendAuthedQueue = (state: RelayState, clock: WallClock): void => {
-  if (!state.ws) return
-  promoteAuthedSubs(state, clock)
-  for (const event of state.pendingAuthPublish) {
-    sendOnWebSocket(state.ws, serialiseEventMessage(event))
-  }
-  // Empty in place rather than rebind: every other RelayState array field is mutated in place, and
-  // the publish-settle closure reads `state.pendingAuthPublish` by reference to splice itself out.
-  state.pendingAuthPublish.length = 0
+const textEncoder = new TextEncoder()
+
+const PING_NOTICE = "ping"
+const AUTH_REJECTED = "auth-required: auth rejected: "
+const AUTH_DECLINED = "auth-required: auth declined"
+const AUTH_TIMED_OUT = "auth-required: auth timed out"
+
+type OkMessage = Extract<RelayMessage, { readonly type: "OK" }>
+type ClosedMessage = Extract<RelayMessage, { readonly type: "CLOSED" }>
+
+// Deliberate: auth-required work is parked only while a handler can still authenticate this connection — see ADR-0001
+const canAwaitAuth = (ctx: MessageContext): boolean =>
+  !ctx.state.authed && !ctx.state.authDeclined && ctx.authHandler() !== null
+
+const hasAuthParked = (state: RelayState): boolean =>
+  state.pendingAuthPublish.size > 0 || state.pendingAuthSubs.size > 0
+
+// Deliberate: one auth timer runs while an answer is in flight or work is parked, and its expiry settles the parked work — see ADR-0001
+const timeOutAuth = (ctx: MessageContext): void => {
+  ctx.state.authTimer = null
+  releaseAuthAttempt(ctx.state)
+  releaseAuthParked(ctx, AUTH_TIMED_OUT)
+  ctx.onStateChange()
 }
 
-const handleAuthChallenge = async (ctx: MessageContext, challenge: string): Promise<void> => {
-  if (ctx.state.authed || ctx.state.authingChallenge === challenge) return
+const restartAuthTimer = (ctx: MessageContext): void => {
+  cancelAuthTimer(ctx.state, ctx.scheduler)
+  ctx.state.authTimer = ctx.scheduler.setTimer(() => timeOutAuth(ctx), ctx.authTimeoutMs)
+}
+
+const ensureAuthTimer = (ctx: MessageContext): void => {
+  if (ctx.state.authTimer === null) restartAuthTimer(ctx)
+}
+
+const stopAuthTimerWhenSettled = (ctx: MessageContext): void => {
+  if (ctx.state.authAttempt === null && !hasAuthParked(ctx.state)) cancelAuthTimer(ctx.state, ctx.scheduler)
+}
+
+const endAuthAttempt = (ctx: MessageContext): void => {
+  releaseAuthAttempt(ctx.state)
+  stopAuthTimerWhenSettled(ctx)
+}
+
+const answerChallenge = async (ctx: MessageContext, challenge: AuthChallenge): Promise<void> => {
+  const { state } = ctx
   const handler = ctx.authHandler()
-  if (!handler || !ctx.state.ws) return
-  ctx.state.authingChallenge = challenge
-  let timer: TimerHandle | undefined
+  if (handler === null || state.ws === null) return
+  const attempt = Symbol("auth attempt")
+  state.authAttempt = attempt
+  state.answeredChallenge = challenge
+  restartAuthTimer(ctx)
   try {
-    const handlerPromise = handler(ctx.url, challenge)
-    // A rejection arriving after the timeout has already settled the race must not surface as a
-    // second unhandled rejection; a pre-timeout rejection still propagates through the race.
-    handlerPromise.catch(() => {})
-    const signed = await Promise.race([
-      handlerPromise,
-      new Promise<never>((_, reject) => {
-        timer = ctx.scheduler.setTimer(
-          () => reject(new Error(`NIP-42 auth handler timed out after ${ctx.authTimeoutMs} ms`)),
-          ctx.authTimeoutMs,
-        )
-      }),
-    ])
-    if (!signed || !ctx.state.ws) return
-    // Optimistic by necessity: NIP-42 makes the relay's OK for the AUTH event optional, and many
-    // relays simply start honouring requests once AUTH is sent. So flush the parked queue now. If
-    // the auth was in fact bad the relay re-CLOSEs the subs with auth-required, and handleClosed
-    // clears `authed` so the paired re-challenge can try again rather than the sub stranding.
-    sendOnWebSocket(ctx.state.ws, serialiseAuthMessage(signed))
-    ctx.state.authed = true
-    ctx.onStateChange()
-    sendAuthedQueue(ctx.state, ctx.clock)
+    const signed = await handler(ctx.url, challenge)
+    if (state.authAttempt !== attempt) return
+    if (signed === null) {
+      state.authDeclined = true
+      releaseAuthParked(ctx, AUTH_DECLINED)
+      endAuthAttempt(ctx)
+      ctx.onStateChange()
+      return
+    }
+    if (state.ws === null) {
+      endAuthAttempt(ctx)
+      return
+    }
+    state.authEventId = signed.id
+    sendOnWebSocket(state.ws, serialiseAuthMessage(signed))
   } catch (err) {
-    // The pool keeps running; surfacing the error as an unhandled rejection makes the auth
-    // failure visible to the host process instead of leaving the relay silently un-authed.
-    ctx.state.authed = false
-    reportUnhandledError(err)
-  } finally {
-    if (timer !== undefined) ctx.scheduler.clearTimer(timer)
-    ctx.state.authingChallenge = null
+    if (state.authAttempt !== attempt) return
+    endAuthAttempt(ctx)
+    queueMicrotask(() => {
+      throw err
+    })
   }
 }
 
-const handleEvent = (ctx: MessageContext, subId: string, event: NostrEvent): void => {
+const handleAuthChallenge = (ctx: MessageContext, challenge: AuthChallenge): void => {
+  ctx.state.challenge = challenge
+  ctx.state.authDeclined = false
+  if (ctx.state.authed || ctx.state.authAttempt !== null) return
+  answerChallenge(ctx, challenge)
+}
+
+const isAnswered = (challenge: AuthChallenge, answered: AuthChallenge | null): boolean =>
+  answered !== null && authChallengesEqual(challenge, answered)
+
+const answerStoredChallenge = (ctx: MessageContext): void => {
+  const { state } = ctx
+  if (state.authed || state.authAttempt !== null) return
+  if (state.challenge === null || isAnswered(state.challenge, state.answeredChallenge)) return
+  answerChallenge(ctx, state.challenge)
+}
+
+const endSub = (ctx: MessageContext, wireSub: WireSub, reason: string): void => {
+  ctx.state.subIdByFilterHash.delete(wireSub.filterHash)
+  for (const listener of wireSub.listeners) listener.onClosed?.(reason)
+}
+
+const resumeAuthParked = (ctx: MessageContext): void => {
+  const { state } = ctx
+  state.authed = true
+  if (state.ws === null) return
+  promoteAuthedSubs(state, ctx.clock)
+  for (const eventId of state.pendingAuthPublish) {
+    const inFlight = state.inFlightPublishes.get(eventId)
+    if (!inFlight) continue
+    inFlight.restartTimeout()
+    sendOnWebSocket(state.ws, serialiseEventMessage(inFlight.event))
+  }
+  state.pendingAuthPublish.clear()
+}
+
+const releaseAuthParked = (ctx: MessageContext, reason: string): void => {
+  const { state } = ctx
+  for (const eventId of [...state.pendingAuthPublish]) {
+    state.inFlightPublishes.get(eventId)?.settle({ ok: false, message: reason })
+  }
+  state.pendingAuthPublish.clear()
+  for (const [subId, wireSub] of state.pendingAuthSubs) {
+    endSub(ctx, wireSub, reason)
+    closeSubHistory({ subHistory: ctx.subHistory, url: ctx.url, subId, clock: ctx.clock })
+  }
+  state.pendingAuthSubs.clear()
+}
+
+// Deliberate: an auth-required answer to our AUTH asks for the fresh challenge, not a final refusal — see ADR-0001
+const handleAuthOk = (ctx: MessageContext, message: OkMessage): void => {
+  releaseAuthAttempt(ctx.state)
+  if (message.accepted) resumeAuthParked(ctx)
+  else if (message.reason === "auth-required") answerStoredChallenge(ctx)
+  else releaseAuthParked(ctx, AUTH_REJECTED + message.message)
+  stopAuthTimerWhenSettled(ctx)
+  ctx.onStateChange()
+}
+
+const handleOk = (ctx: MessageContext, message: OkMessage): void => {
+  const { state } = ctx
+  if (message.eventId === state.authEventId) {
+    handleAuthOk(ctx, message)
+    return
+  }
+  const inFlight = state.inFlightPublishes.get(message.eventId)
+  if (!inFlight) return
+  if (!message.accepted && message.reason === "auth-required" && canAwaitAuth(ctx)) {
+    inFlight.suspendTimeout()
+    state.pendingAuthPublish.add(message.eventId)
+    answerStoredChallenge(ctx)
+    ensureAuthTimer(ctx)
+    return
+  }
+  inFlight.settle({ ok: message.accepted, message: message.message })
+}
+
+// Deliberate: a ping NOTICE is a liveness probe answered with a keepalive CLOSE, not a message — see ADR-0004
+const handleNotice = (ctx: MessageContext, notice: string): void => {
+  if (notice.trim().toLowerCase() !== PING_NOTICE || ctx.state.ws === null) return
+  sendKeepalive(ctx.state.ws)
+}
+
+const handleEvent = (ctx: MessageContext, subId: SubscriptionId, event: NostrEvent): void => {
   const wireSub = ctx.state.subs.get(subId)
   if (!wireSub) return
   if (!wireSub.compiled.matches(event)) return
@@ -85,7 +195,7 @@ const handleEvent = (ctx: MessageContext, subId: string, event: NostrEvent): voi
   for (const listener of wireSub.listeners) listener.onEvent(event, ctx.url)
 }
 
-const handleEose = (ctx: MessageContext, subId: string): void => {
+const handleEose = (ctx: MessageContext, subId: SubscriptionId): void => {
   const wireSub = ctx.state.subs.get(subId)
   if (!wireSub || wireSub.eoseFired) return
   wireSub.eoseFired = true
@@ -95,56 +205,40 @@ const handleEose = (ctx: MessageContext, subId: string): void => {
   for (const listener of wireSub.listeners) listener.onEose?.()
 }
 
-const handleClosed = (ctx: MessageContext, subId: string, message: string): void => {
+const handleClosed = (ctx: MessageContext, { subscriptionId: subId, message, reason }: ClosedMessage): void => {
   const { state } = ctx
   const wireSub = state.subs.get(subId) ?? state.pendingSubs.get(subId)
   if (!wireSub) return
 
   state.subs.delete(subId)
   state.pendingSubs.delete(subId)
-  clearTimerEntry(ctx.scheduler, state.pendingSubTimeouts, subId)
+  cancelPendingSubTimeout(state, ctx.scheduler, subId)
 
-  if (message.startsWith("auth-required")) {
-    // A relay demanding auth for a sub we believed was authed means our optimistic auth was stale
-    // or rejected; clear `authed` so the paired AUTH re-challenge drives a fresh handshake rather
-    // than being short-circuited by the `authed` guard — which would otherwise strand this sub.
-    state.authed = false
-    state.pendingAuthSubs.set(subId, wireSub)
+  if (reason === "auth-required" && canAwaitAuth(ctx)) {
     // The sub is re-parked, not closed: it lives on in pendingAuthSubs awaiting the AUTH handshake,
     // so its history entry stays open. Stamping closedAt here would mislabel a still-pending sub as
     // closed (masked while live, but wrong the moment it later genuinely closes).
+    state.pendingAuthSubs.set(subId, wireSub)
+    answerStoredChallenge(ctx)
+    ensureAuthTimer(ctx)
   } else {
-    state.subIdByFilterHash.delete(wireSub.filterHash)
     // A relay-initiated CLOSED terminates the subscription — unlike a socket drop it will not be
     // revived. Fire the distinct onClosed terminal signal: CLOSED is not EOSE, so a persistent
     // listener learns the stream is dead rather than that the backlog merely ended, and an
     // EOSE-or-timeout fan-in settles now instead of hanging until its hard timeout.
-    for (const listener of wireSub.listeners) listener.onClosed?.(message)
+    endSub(ctx, wireSub, message)
     closeSubHistory({ subHistory: ctx.subHistory, url: ctx.url, subId, clock: ctx.clock })
   }
 
   ctx.onStateChange()
 }
 
-const handleAuthRequiredOk = (ctx: MessageContext, eventId: string): void => {
-  // Park the in-flight event for resend once AUTH completes. The in-flight record stays put (timer
-  // and resolvers intact): the publish must still settle on its original deadline if AUTH never
-  // succeeds (no handler, or a handler that fails), and a genuine OK after the resend settles it
-  // via handleOkResult. Guard against a repeat auth-required OK queueing the same event twice.
-  const inFlight = ctx.state.inFlightPublishes.get(eventId)
-  if (inFlight && !ctx.state.pendingAuthPublish.includes(inFlight.event)) {
-    ctx.state.pendingAuthPublish.push(inFlight.event)
-  }
-}
+const exceedsUtf8Bytes = (text: string, limit: number): boolean =>
+  text.length > limit || (text.length * 3 > limit && textEncoder.encode(text).length > limit)
 
-const handleOkResult = (ctx: MessageContext, eventId: string, ack: PublishAck): void => {
-  // The publish settlement (createPublish's `settle`) owns all teardown — timer, bookkeeping,
-  // and resolution. Dispatch the ack to it; do not duplicate that cleanup here.
-  ctx.state.inFlightPublishes.get(eventId)?.settle(ack)
-}
-
+// Deliberate: an oversized frame is dropped like a malformed one, never closing the connection — see ADR-0008
 export const handleRelayMessage = (ctx: MessageContext, msg: MessageEvent): void => {
-  if (typeof msg.data !== "string") return
+  if (typeof msg.data !== "string" || exceedsUtf8Bytes(msg.data, ctx.maxMessageBytes)) return
   const message = parseRelayMessage(msg.data)
   if (message === null) return
 
@@ -159,15 +253,13 @@ export const handleRelayMessage = (ctx: MessageContext, msg: MessageEvent): void
       handleEose(ctx, message.subscriptionId)
       return
     case "CLOSED":
-      handleClosed(ctx, message.subscriptionId, message.message)
+      handleClosed(ctx, message)
       return
     case "OK":
-      if (!message.accepted && message.message.startsWith("auth-required")) {
-        handleAuthRequiredOk(ctx, message.eventId)
-      } else {
-        handleOkResult(ctx, message.eventId, { ok: message.accepted, message: message.message })
-      }
+      handleOk(ctx, message)
       return
-      // NOTICE and COUNT are not actioned by the pool.
+    case "NOTICE":
+      handleNotice(ctx, message.message)
+      return
   }
 }

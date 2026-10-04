@@ -1,15 +1,32 @@
-import type { NostrFilter, RelayUrl } from "@innis/nostr-core"
-import { compileFilters, hashFilters, serialiseCloseMessage } from "@innis/nostr-core"
+import type { NostrFilter, RelayUrl, SubscriptionId } from "@innis/nostr-core"
+import { canFilterMatch, compileFilters, hashFilters, serialiseCloseMessage } from "@innis/nostr-core"
 import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler } from "../../application/port/scheduler.ts"
 import { closeSubHistory, recordSubHistory, type SubHistoryMap } from "../../application/service/relay-history.ts"
 import type { RelaySubscribeCallbacks, Subscription } from "../../domain/value-object/subscription.ts"
 import type { SubListener, WireSub } from "./wire-sub.ts"
 import type { RelayState } from "./relay-state.ts"
-import { findWireSub, reissueReq } from "./relay-state.ts"
-import { clearTimerEntry, isOpen, sendOnWebSocket } from "./web-socket-helpers.ts"
+import { cancelPendingSubTimeout, findWireSub, reissueReq } from "./relay-state.ts"
+import { isOpen, sendOnWebSocket, subscriptionIdOf } from "./web-socket-helpers.ts"
+
+// Deliberate: a relay answers a NIP-50 search by its own reading, so what it sends is checked against the rest — see shared ADR-0082
+const withoutSearch = ({ search: _search, ...conditions }: NostrFilter): NostrFilter => conditions
 
 export const INACTIVE_SUBSCRIPTION: Subscription = Object.freeze({ active: false, unsubscribe: (): void => {} })
+
+// Deliberate: a subscription no filter of which can match anything is answered here, not sent — see ADR-0006
+const matchingNothing = (callbacks: RelaySubscribeCallbacks): Subscription => {
+  let open = true
+  queueMicrotask(() => {
+    if (open) callbacks.onEose?.()
+  })
+  return Object.freeze({
+    active: true,
+    unsubscribe: (): void => {
+      open = false
+    },
+  })
+}
 
 export interface SubscribeDeps {
   readonly clock: WallClock
@@ -21,7 +38,7 @@ export interface SubscribeDeps {
    * reconnect after its socket dropped. Unsubscribe must reach the parked state too: a sub left
    * there would be resurrected by the reconnect as a REQ no caller can ever close.
    */
-  readonly findOwningState: (url: RelayUrl, subId: string) => RelayState | undefined
+  readonly findOwningState: (url: RelayUrl, subId: SubscriptionId) => RelayState | undefined
   readonly invalidateCache: () => void
   readonly isDisposed: () => boolean
   readonly getOrCreateConnection: (url: RelayUrl) => RelayState | null
@@ -41,9 +58,9 @@ export const createSubscribe = (deps: SubscribeDeps) => {
     releaseIfIdle,
   } = deps
   let subCounter = 0
-  const nextSubId = (): string => `pool-${++subCounter}`
+  const nextSubId = (): SubscriptionId => subscriptionIdOf(`pool-${++subCounter}`)
 
-  const schedulePendingSubTimeout = (state: RelayState, url: RelayUrl, subId: string): void => {
+  const schedulePendingSubTimeout = (state: RelayState, url: RelayUrl, subId: SubscriptionId): void => {
     const timeoutId = scheduler.setTimer(() => {
       const wireSub = state.pendingSubs.get(subId)
       if (!wireSub) return
@@ -69,6 +86,7 @@ export const createSubscribe = (deps: SubscribeDeps) => {
     callbacks: RelaySubscribeCallbacks,
   ): Subscription => {
     if (isDisposed()) return INACTIVE_SUBSCRIPTION
+    if (!filters.some(canFilterMatch)) return matchingNothing(callbacks)
     const state = getOrCreateConnection(url)
     if (!state) return INACTIVE_SUBSCRIPTION
 
@@ -82,7 +100,7 @@ export const createSubscribe = (deps: SubscribeDeps) => {
     const existingSubId = state.subIdByFilterHash.get(filterHash)
     const existingWireSub = existingSubId !== undefined ? findWireSub(state, existingSubId) : undefined
 
-    let subId: string
+    let subId: SubscriptionId
     let wireSub: WireSub
 
     if (existingWireSub && existingSubId !== undefined) {
@@ -101,7 +119,7 @@ export const createSubscribe = (deps: SubscribeDeps) => {
       wireSub = {
         filters,
         filterHash,
-        compiled: compileFilters(filters),
+        compiled: compileFilters(filters.map(withoutSearch)),
         listeners: [listener],
         eoseFired: false,
         reqSentAt: 0,
@@ -141,7 +159,7 @@ export const createSubscribe = (deps: SubscribeDeps) => {
         if (owningState.subIdByFilterHash.get(wireSub.filterHash) === subId) {
           owningState.subIdByFilterHash.delete(wireSub.filterHash)
         }
-        clearTimerEntry(scheduler, owningState.pendingSubTimeouts, subId)
+        cancelPendingSubTimeout(owningState, scheduler, subId)
         // A live (non-pending) sub needs a CLOSE on the wire. sendOnWebSocket is the single send
         // primitive and no-ops unless the socket is open, so there is nothing to pre-check here.
         const currentWs = owningState.ws

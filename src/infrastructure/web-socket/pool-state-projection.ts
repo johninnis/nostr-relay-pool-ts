@@ -1,4 +1,4 @@
-import type { RelayUrl } from "@innis/nostr-core"
+import type { RelayUrl, SubscriptionId } from "@innis/nostr-core"
 import type { BackoffTracker } from "../../application/service/backoff-tracker.ts"
 import type { PublishHistoryRecord, SubHistoryRecord } from "../../application/service/relay-history.ts"
 import type { PublishHistoryEntry } from "../../domain/value-object/publish-history.ts"
@@ -12,7 +12,7 @@ import { isConnecting, isOpen } from "./web-socket-helpers.ts"
 export interface PoolSnapshot {
   readonly connections: ReadonlyMap<RelayUrl, RelayState>
   readonly attemptedRelays: ReadonlySet<RelayUrl>
-  readonly subHistory: ReadonlyMap<RelayUrl, Map<string, SubHistoryRecord>>
+  readonly subHistory: ReadonlyMap<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>
   readonly publishHistory: ReadonlyMap<RelayUrl, ReadonlyArray<PublishHistoryRecord>>
   readonly relayEventCounts: ReadonlyMap<RelayUrl, number>
   readonly relayPublishCounts: ReadonlyMap<RelayUrl, number>
@@ -40,12 +40,12 @@ interface SubscriptionCounts {
 // Both the counts and the detailed listing derive from this one walk.
 const classifySubscriptions = (
   state: RelayState | undefined,
-  history: ReadonlyMap<string, SubHistoryRecord> | undefined,
+  history: ReadonlyMap<SubscriptionId, SubHistoryRecord> | undefined,
 ): ReadonlyArray<RelaySubscriptionEntry> => {
   const accounted = new Set<string>()
   const result: Array<RelaySubscriptionEntry> = []
 
-  const collectFromMap = (map: ReadonlyMap<string, WireSub>, status: SubscriptionStatus): void => {
+  const collectFromMap = (map: ReadonlyMap<SubscriptionId, WireSub>, status: SubscriptionStatus): void => {
     for (const [subId, sub] of map) {
       if (accounted.has(subId)) continue
       accounted.add(subId)
@@ -86,7 +86,7 @@ const classifySubscriptions = (
 
 const countSubscriptions = (
   state: RelayState | undefined,
-  history: ReadonlyMap<string, SubHistoryRecord> | undefined,
+  history: ReadonlyMap<SubscriptionId, SubHistoryRecord> | undefined,
 ): SubscriptionCounts => {
   let active = 0
   let pending = 0

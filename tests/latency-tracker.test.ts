@@ -1,8 +1,8 @@
 import { assertEquals } from "@std/assert"
-import { parseRelayUrl } from "@innis/nostr-core"
+import { relayUrlFixture } from "@innis/nostr-core/testing"
 import { createLatencyTracker } from "../src/application/service/latency-tracker.ts"
 
-const url = parseRelayUrl("wss://relay.example.com")
+const url = relayUrlFixture("wss://relay.example.com")
 
 Deno.test("cold relay returns defaultTimeoutMs", () => {
   const t = createLatencyTracker()
@@ -85,8 +85,8 @@ Deno.test("tracks samples per relay independently", () => {
     sampleSize: 20,
     minSamples: 3,
   })
-  const fast = parseRelayUrl("wss://fast.example.com")
-  const slow = parseRelayUrl("wss://slow.example.com")
+  const fast = relayUrlFixture("wss://fast.example.com")
+  const slow = relayUrlFixture("wss://slow.example.com")
   for (let i = 0; i < 5; i++) {
     t.record(fast, 100)
     t.record(slow, 6000)

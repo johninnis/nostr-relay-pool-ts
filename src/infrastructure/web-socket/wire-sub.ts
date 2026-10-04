@@ -8,8 +8,9 @@ export type SubListener = RelaySubscribeCallbacks
 // Mutable transport state for a single REQ in flight on a socket — not a domain value object, which
 // is why it lives beside the socket plumbing rather than under domain/value-object.
 //
-// `compiled` is `filters` compiled once at construction, so the per-event match in the message
-// handler never recompiles; `filters` itself is kept for REQ serialisation and history.
+// `compiled` is `filters` compiled once at construction, less any NIP-50 search, which the relay
+// answers by its own reading, so the per-event match in the message handler never recompiles;
+// `filters` itself is kept for REQ serialisation and history.
 //
 // `listeners` is copy-on-write: never mutated in place, only replaced with a new array. Dispatch
 // sites iterate the array directly — `for...of` evaluates the expression once, so a re-entrant

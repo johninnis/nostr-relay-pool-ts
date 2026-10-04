@@ -4,10 +4,4 @@ export type { PublishHistoryEntry, PublishOutcome, PublishResponse } from "./pub
 export type { RelayPoolStateEntry } from "./relay-pool-state-entry.ts"
 export type { RelayStatus } from "./relay-status.ts"
 export type { RelaySubscriptionEntry, SubscriptionStatus } from "./relay-subscription.ts"
-export type {
-  PoolSubscription,
-  RelaySubscribeCallbacks,
-  SubscribeCallbacks,
-  SubscribeManyOptions,
-  Subscription,
-} from "./subscription.ts"
+export type { PoolSubscription, RelaySubscribeCallbacks, SubscribeManyCallbacks, Subscription } from "./subscription.ts"

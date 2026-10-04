@@ -1,9 +1,8 @@
 import { assertEquals, assertNotEquals } from "@std/assert"
-import { createRelayPool } from "../src/infrastructure/adapter/web-socket-relay-pool-adapter.ts"
-import { buildEventFixture } from "@innis/nostr-core/testing"
+import { createRelayPool } from "../src/infrastructure/web-socket/web-socket-relay-pool.ts"
 import { createInMemoryRelay } from "../testing.ts"
 import type { NostrEvent } from "@innis/nostr-core"
-import { parsePublicKey } from "@innis/nostr-core"
+import { buildEventFixture, publicKeyFixture } from "@innis/nostr-core/testing"
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -151,24 +150,24 @@ Deno.test("subscribeMany single-URL: delivers events and fires onRelayEose on EO
   }
 })
 
-Deno.test("subscribeMany syncUrls: closes removed and opens added connections", async () => {
+Deno.test("subscribeManyLive syncUrls: closes removed and opens added connections", async () => {
   const relayA = createInMemoryRelay()
   const relayB = createInMemoryRelay()
   await relayA.start()
   await relayB.start()
   const pool = createRelayPool()
   try {
-    const eventA = buildEventFixture({ kind: 1 })
-    const eventB = buildEventFixture({ kind: 1 })
+    const eventA = buildEventFixture({ kind: 1, content: "on relay A" })
+    const eventB = buildEventFixture({ kind: 1, content: "on relay B" })
     relayA.inject(eventA)
     relayB.inject(eventB)
 
     const received: NostrEvent[] = []
-    const sub = pool.subscribeMany([relayA.url], [{ kinds: [1] }], {
+    const sub = pool.subscribeManyLive([relayA.url], [{ kinds: [1] }], {
       onEvent: (e) => {
         received.push(e)
       },
-    }, { persistent: true })
+    })
 
     await delay(200)
     assertEquals(received.some((e) => e.id === eventA.id), true)
@@ -228,8 +227,8 @@ Deno.test("getRelayPoolState exposes per-relay eventCount", async () => {
   await relay.start()
   const pool = createRelayPool()
   try {
-    relay.inject(buildEventFixture({ kind: 1 }))
-    relay.inject(buildEventFixture({ kind: 1 }))
+    relay.inject(buildEventFixture({ kind: 1, content: "first" }))
+    relay.inject(buildEventFixture({ kind: 1, content: "second" }))
 
     pool.subscribe(relay.url, [{ kinds: [1] }], { onEvent: () => {} })
     await delay(300)
@@ -409,7 +408,7 @@ Deno.test("subscribe dedup: filter key order and array order do not matter", asy
   await relay.start()
   const pool = createRelayPool()
   try {
-    const author = parsePublicKey("a".repeat(64))
+    const author = publicKeyFixture("a".repeat(64))
     pool.subscribe(relay.url, [{ kinds: [1, 2], authors: [author] }], { onEvent: () => {} })
     pool.subscribe(relay.url, [{ authors: [author], kinds: [2, 1] }], { onEvent: () => {} })
 

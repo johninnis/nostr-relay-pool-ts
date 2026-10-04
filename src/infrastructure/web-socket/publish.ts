@@ -1,7 +1,7 @@
 import type { NostrEvent, RelayUrl } from "@innis/nostr-core"
 import { serialiseEventMessage } from "@innis/nostr-core"
 import type { WallClock } from "../../application/port/clock.ts"
-import type { Scheduler } from "../../application/port/scheduler.ts"
+import type { Scheduler, TimerHandle } from "../../application/port/scheduler.ts"
 import type { PublishOutcome, PublishResponse } from "../../domain/value-object/publish-history.ts"
 import { type PublishHistoryRecord, recordPublishEntry } from "../../application/service/relay-history.ts"
 import type { PublishAck, RelayState } from "./relay-state.ts"
@@ -57,18 +57,23 @@ export const createPublish = (deps: PublishDeps) => {
       // A new publish (not a dedup join): bump the lifetime tally, which also invalidates the cache.
       onPublishInitiated(url)
 
+      let timeoutId: TimerHandle | null = null
+      const suspendTimeout = (): void => {
+        if (timeoutId !== null) scheduler.clearTimer(timeoutId)
+        timeoutId = null
+      }
+
       // Single settlement path for every outcome (ack, timeout, disconnect, dispose): clear the timer,
       // drop the in-flight record, leave the AUTH resend queue, stamp the history record, and resolve
       // every awaiting caller exactly once.
       const settle = (outcome: PublishOutcome, ack: PublishAck): void => {
         const inFlight = state.inFlightPublishes.get(event.id)
         if (!inFlight) return
-        scheduler.clearTimer(inFlight.timeoutId)
+        suspendTimeout()
         state.inFlightPublishes.delete(event.id)
-        // An event parked for AUTH that settles (e.g. times out before AUTH completes) must leave the
-        // resend queue too, or a later successful AUTH re-sends an already-resolved publish.
-        const parkedIndex = state.pendingAuthPublish.indexOf(event)
-        if (parkedIndex !== -1) state.pendingAuthPublish.splice(parkedIndex, 1)
+        // An event parked for AUTH that settles (e.g. its connection drops) must leave the resend
+        // queue too, or a later successful AUTH re-sends an already-resolved publish.
+        state.pendingAuthPublish.delete(event.id)
         record.result = outcome
         record.message = ack.message
         invalidateCache()
@@ -79,12 +84,18 @@ export const createPublish = (deps: PublishDeps) => {
         releaseIfIdle(url, state)
       }
 
-      const timeoutId = scheduler.setTimer(() => settle("timeout", { ok: false, message: "timeout" }), publishTimeoutMs)
+      // Deliberate: a publish parked for AUTH is bounded by the auth timeout, not its own — see ADR-0003
+      const restartTimeout = (): void => {
+        suspendTimeout()
+        timeoutId = scheduler.setTimer(() => settle("timeout", { ok: false, message: "timeout" }), publishTimeoutMs)
+      }
+      restartTimeout()
       state.inFlightPublishes.set(event.id, {
         event,
         resolvers: new Set([resolve]),
-        timeoutId,
         settle: (ack) => settle(ack.ok ? "ok" : "failed", ack),
+        suspendTimeout,
+        restartTimeout,
       })
 
       const ws = state.ws

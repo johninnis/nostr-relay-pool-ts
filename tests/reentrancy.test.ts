@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert"
 import type { NostrEvent } from "@innis/nostr-core"
 import { buildEventFixture } from "@innis/nostr-core/testing"
-import { createRelayPool } from "../src/infrastructure/adapter/web-socket-relay-pool-adapter.ts"
+import { createRelayPool } from "../src/infrastructure/web-socket/web-socket-relay-pool.ts"
 import { createInMemoryRelay } from "../testing.ts"
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))

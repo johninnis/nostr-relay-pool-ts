@@ -1,11 +1,11 @@
-import type { NostrEvent, RelayUrl } from "@innis/nostr-core"
+import type { AuthChallenge, NostrEvent, RelayUrl, SubscriptionId } from "@innis/nostr-core"
 import { serialiseReqMessage } from "@innis/nostr-core"
 import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler, TimerHandle } from "../../application/port/scheduler.ts"
 import { closeSubHistory, type SubHistoryMap } from "../../application/service/relay-history.ts"
 import type { PublishResponse } from "../../domain/value-object/publish-history.ts"
 import type { WireSub } from "./wire-sub.ts"
-import { clearAllTimers, closeWebSocket, sendOnWebSocket } from "./web-socket-helpers.ts"
+import { closeWebSocket, sendOnWebSocket } from "./web-socket-helpers.ts"
 
 /** Internal publish-resolver shape — the per-relay `OK` reply, without the `from` URL the pool adds. */
 export type PublishAck = Omit<PublishResponse, "from">
@@ -21,23 +21,30 @@ export interface InFlightPublish {
   readonly event: NostrEvent
   readonly resolvers: Set<(response: PublishResponse) => void>
   readonly settle: (ack: PublishAck) => void
-  readonly timeoutId: TimerHandle
+  readonly suspendTimeout: () => void
+  readonly restartTimeout: () => void
 }
 
 export interface RelayState {
   ws: WebSocket | null
-  subs: Map<string, WireSub>
-  pendingSubs: Map<string, WireSub>
-  pendingSubTimeouts: Map<string, TimerHandle>
-  subIdByFilterHash: Map<string, string>
+  subs: Map<SubscriptionId, WireSub>
+  pendingSubs: Map<SubscriptionId, WireSub>
+  pendingSubTimeouts: Map<SubscriptionId, TimerHandle>
+  subIdByFilterHash: Map<string, SubscriptionId>
   intentionalClose: boolean
   authed: boolean
-  authingChallenge: string | null
+  challenge: AuthChallenge | null
+  answeredChallenge: AuthChallenge | null
+  authDeclined: boolean
+  authAttempt: symbol | null
+  authTimer: TimerHandle | null
+  authEventId: string | null
   connectedAt: number | null
   stabilityTimer: TimerHandle | null
   idleTimer: TimerHandle | null
-  pendingAuthPublish: Array<NostrEvent>
-  pendingAuthSubs: Map<string, WireSub>
+  heartbeatTimer: TimerHandle | null
+  pendingAuthPublish: Set<string>
+  pendingAuthSubs: Map<SubscriptionId, WireSub>
   inFlightPublishes: Map<string, InFlightPublish>
 }
 
@@ -49,11 +56,17 @@ export const createRelayState = (): RelayState => ({
   subIdByFilterHash: new Map(),
   intentionalClose: false,
   authed: false,
-  authingChallenge: null,
+  challenge: null,
+  answeredChallenge: null,
+  authDeclined: false,
+  authAttempt: null,
+  authTimer: null,
+  authEventId: null,
   connectedAt: null,
   stabilityTimer: null,
   idleTimer: null,
-  pendingAuthPublish: [],
+  heartbeatTimer: null,
+  pendingAuthPublish: new Set(),
   pendingAuthSubs: new Map(),
   inFlightPublishes: new Map(),
 })
@@ -65,12 +78,12 @@ export const transferPendingState = (from: RelayState, to: RelayState): void => 
   for (const [hash, subId] of from.subIdByFilterHash) to.subIdByFilterHash.set(hash, subId)
 }
 
-export const findWireSub = (state: RelayState, subId: string): WireSub | undefined =>
+export const findWireSub = (state: RelayState, subId: SubscriptionId): WireSub | undefined =>
   state.subs.get(subId) ?? state.pendingSubs.get(subId) ?? state.pendingAuthSubs.get(subId)
 
 export interface ReissueReqInput {
   readonly ws: WebSocket
-  readonly subId: string
+  readonly subId: SubscriptionId
   readonly sub: WireSub
   readonly clock: WallClock
 }
@@ -84,13 +97,14 @@ export interface ReissueReqInput {
 export const reissueReq = ({ ws, subId, sub, clock }: ReissueReqInput): void => {
   sub.eoseFired = false
   sub.reqSentAt = clock()
-  sendOnWebSocket(ws, serialiseReqMessage(subId, sub.filters))
+  const req = serialiseReqMessage(subId, sub.filters)
+  if (req !== null) sendOnWebSocket(ws, req)
 }
 
 /**
  * Promote every auth-parked sub onto the live socket: re-issue its REQ and move it into `subs`.
- * Shared by the reconnect path (socket reopen) and the post-AUTH flush so the parked-sub promotion
- * lives in exactly one place.
+ * Shared by the reconnect path (socket reopen) and the flush on the relay's `OK true` for our AUTH
+ * event so the parked-sub promotion lives in exactly one place.
  */
 export const promoteAuthedSubs = (state: RelayState, clock: WallClock): void => {
   const ws = state.ws
@@ -111,7 +125,7 @@ export const hasAnySubs = (state: RelayState): boolean =>
  * caller", consulted both when scheduling an idle close and again when its timer fires.
  */
 export const isIdle = (state: RelayState): boolean =>
-  !hasAnySubs(state) && state.inFlightPublishes.size === 0 && state.pendingAuthPublish.length === 0
+  !hasAnySubs(state) && state.inFlightPublishes.size === 0 && state.pendingAuthPublish.size === 0
 
 /**
  * Close a socket the pool itself is taking down. Flagging the close as intentional stops the
@@ -148,5 +162,34 @@ export const tearDownSubs = ({ state, url, subHistory, clock, scheduler, reason 
   state.pendingSubs.clear()
   state.pendingAuthSubs.clear()
   state.subIdByFilterHash.clear()
-  clearAllTimers(scheduler, state.pendingSubTimeouts)
+  cancelPendingSubTimeouts(state, scheduler)
+}
+
+export const releaseAuthAttempt = (state: RelayState): void => {
+  state.authAttempt = null
+  state.authEventId = null
+}
+
+/** Cancel the watchdog of the pending sub `subId`, if it has one. */
+export const cancelPendingSubTimeout = (state: RelayState, scheduler: Scheduler, subId: SubscriptionId): void => {
+  const timer = state.pendingSubTimeouts.get(subId)
+  if (timer !== undefined) scheduler.clearTimer(timer)
+  state.pendingSubTimeouts.delete(subId)
+}
+
+/** Cancel the watchdog of every pending sub. */
+export const cancelPendingSubTimeouts = (state: RelayState, scheduler: Scheduler): void => {
+  for (const timer of state.pendingSubTimeouts.values()) scheduler.clearTimer(timer)
+  state.pendingSubTimeouts.clear()
+}
+
+export const cancelAuthTimer = (state: RelayState, scheduler: Scheduler): void => {
+  if (state.authTimer !== null) scheduler.clearTimer(state.authTimer)
+  state.authTimer = null
+}
+
+/** Drop the connection's AUTH answer in flight and its auth timer, for a connection that is going away. */
+export const abandonAuth = (state: RelayState, scheduler: Scheduler): void => {
+  releaseAuthAttempt(state)
+  cancelAuthTimer(state, scheduler)
 }

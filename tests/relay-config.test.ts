@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert"
 import type { RelayUrl } from "@innis/nostr-core"
-import { parseRelayUrl } from "@innis/nostr-core"
+import { relayUrlFixture } from "@innis/nostr-core/testing"
 import type { RelayPool } from "../src/application/port/relay-pool.ts"
 import { createRelayConfig } from "../src/application/service/relay-config.ts"
 
@@ -16,6 +16,7 @@ const stubPool = (): RelayPool & { gates: Array<(url: RelayUrl) => boolean> } =>
     gates,
     subscribe: unimplemented,
     subscribeMany: unimplemented,
+    subscribeManyLive: unimplemented,
     publish: unimplemented,
     getConnectedRelayUrls: () => [],
     getAttemptedRelayUrls: () => [],
@@ -32,8 +33,8 @@ const stubPool = (): RelayPool & { gates: Array<(url: RelayUrl) => boolean> } =>
   }
 }
 
-const URL_A = parseRelayUrl("wss://a.example.com")
-const URL_B = parseRelayUrl("wss://b.example.com")
+const URL_A = relayUrlFixture("wss://a.example.com")
+const URL_B = relayUrlFixture("wss://b.example.com")
 
 Deno.test("createRelayConfig - defaults are unrestricted and empty allowlist", () => {
   const pool = stubPool()

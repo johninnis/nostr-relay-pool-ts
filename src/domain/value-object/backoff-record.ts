@@ -22,5 +22,5 @@ export interface BackoffRecord {
   /** Index into the backoff schedule — how many consecutive failures have elapsed. */
   readonly step: number
   /** Detail of the failure that opened this cooldown, when known. */
-  readonly lastFailure?: BackoffFailureInfo
+  readonly lastFailure?: BackoffFailureInfo | undefined
 }

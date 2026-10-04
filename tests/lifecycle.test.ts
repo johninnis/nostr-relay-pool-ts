@@ -1,7 +1,6 @@
 import { assertEquals, assertNotEquals } from "@std/assert"
-import { parseRelayUrl } from "@innis/nostr-core"
-import { buildEventFixture } from "@innis/nostr-core/testing"
-import { createRelayPool } from "../src/infrastructure/adapter/web-socket-relay-pool-adapter.ts"
+import { buildEventFixture, relayUrlFixture } from "@innis/nostr-core/testing"
+import { createRelayPool } from "../src/infrastructure/web-socket/web-socket-relay-pool.ts"
 import { createInMemoryRelay } from "../testing.ts"
 import { createManualTime } from "./_helpers/scheduler.ts"
 
@@ -88,7 +87,7 @@ Deno.test("setConnectionGate - cancels a pending reconnect for a now-disallowed 
 
 Deno.test("getRelayPoolState - a disabled entry refreshes once its cooldown lapses by time alone", () => {
   const time = createManualTime(1000)
-  const url = parseRelayUrl("wss://relay.invalid")
+  const url = relayUrlFixture("wss://relay.invalid")
   const pool = createRelayPool({
     clock: time.clock,
     scheduler: time.scheduler,

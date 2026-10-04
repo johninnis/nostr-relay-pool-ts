@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert"
 import type { ConnectionPool } from "../src/application/port/connection-pool.ts"
 import type { RelaySubscribeCallbacks, Subscription } from "../src/domain/value-object/subscription.ts"
-import { createSubscribeMany } from "../src/application/service/subscribe-many.ts"
+import { createSubscribeMany, createSubscribeManyLive } from "../src/application/service/subscribe-many.ts"
 import { createManualTime } from "./_helpers/scheduler.ts"
 
 const URL = "wss://relay.example.com"
@@ -28,20 +28,20 @@ const capturingPool = (): CapturingPool => {
   }
 }
 
-Deno.test("subscribeMany - a relay CLOSED drops the handle so syncUrls reopens the relay", () => {
+Deno.test("subscribeManyLive - a relay CLOSED drops the handle so syncUrls reopens the relay", () => {
   const time = createManualTime()
   const capturing = capturingPool()
-  const subscribeMany = createSubscribeMany({
+  const subscribeManyLive = createSubscribeManyLive({
     connectionPool: capturing.pool,
     scheduler: time.scheduler,
     hardTimeoutMs: 12_000,
   })
 
   const closedReasons: string[] = []
-  const handle = subscribeMany([URL], [{ kinds: [1] }], {
+  const handle = subscribeManyLive([URL], [{ kinds: [1] }], {
     onEvent: () => {},
     onRelayClosed: (_url, reason) => closedReasons.push(reason),
-  }, { persistent: true })
+  })
 
   assertEquals(capturing.subscribeCount(), 1)
 
@@ -56,7 +56,7 @@ Deno.test("subscribeMany - a relay CLOSED drops the handle so syncUrls reopens t
   handle.unsubscribe()
 })
 
-Deno.test("subscribeMany - a non-persistent relay EOSE drops the handle so syncUrls reopens the relay", () => {
+Deno.test("subscribeMany - a relay EOSE drops the handle so syncUrls reopens the relay", () => {
   const time = createManualTime()
   const capturing = capturingPool()
   const subscribeMany = createSubscribeMany({
@@ -65,7 +65,7 @@ Deno.test("subscribeMany - a non-persistent relay EOSE drops the handle so syncU
     hardTimeoutMs: 12_000,
   })
 
-  // Default (non-persistent): each leg closes at EOSE once the stored backlog drains.
+  // Each leg closes at EOSE once the stored backlog drains.
   const handle = subscribeMany([URL], [{ kinds: [1] }], { onEvent: () => {}, onRelayEose: () => {} })
   assertEquals(capturing.subscribeCount(), 1)
 
@@ -79,20 +79,38 @@ Deno.test("subscribeMany - a non-persistent relay EOSE drops the handle so syncU
   handle.unsubscribe()
 })
 
-Deno.test("subscribeMany - syncUrls is a no-op for an unchanged, still-live relay", () => {
+Deno.test("subscribeManyLive - syncUrls is a no-op for an unchanged, still-live relay", () => {
   const time = createManualTime()
   const capturing = capturingPool()
-  const subscribeMany = createSubscribeMany({
+  const subscribeManyLive = createSubscribeManyLive({
     connectionPool: capturing.pool,
     scheduler: time.scheduler,
     hardTimeoutMs: 12_000,
   })
 
-  const handle = subscribeMany([URL], [{ kinds: [1] }], { onEvent: () => {} }, { persistent: true })
+  const handle = subscribeManyLive([URL], [{ kinds: [1] }], { onEvent: () => {} })
   assertEquals(capturing.subscribeCount(), 1)
 
   handle.syncUrls([URL])
   assertEquals(capturing.subscribeCount(), 1, "a live relay should not be reopened")
+
+  handle.unsubscribe()
+})
+
+Deno.test("subscribeManyLive - a relay EOSE keeps the handle so syncUrls does not reopen the relay", () => {
+  const time = createManualTime()
+  const capturing = capturingPool()
+  const subscribeManyLive = createSubscribeManyLive({
+    connectionPool: capturing.pool,
+    scheduler: time.scheduler,
+    hardTimeoutMs: 12_000,
+  })
+
+  const handle = subscribeManyLive([URL], [{ kinds: [1] }], { onEvent: () => {} })
+  capturing.lastCallbacks()?.onEose?.()
+
+  handle.syncUrls([URL])
+  assertEquals(capturing.subscribeCount(), 1, "a live leg stays open past EOSE")
 
   handle.unsubscribe()
 })

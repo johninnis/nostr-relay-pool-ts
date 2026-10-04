@@ -1,4 +1,4 @@
-import type { NostrFilter } from "@innis/nostr-core"
+import type { NostrFilter, SubscriptionId } from "@innis/nostr-core"
 
 /**
  * State of one subscription: `active` (live on the open socket), `pending` (awaiting a socket open
@@ -12,7 +12,7 @@ export type SubscriptionStatus = "active" | "pending" | "closed"
  */
 export interface RelaySubscriptionEntry {
   /** The pool-assigned wire subscription id (`pool-N`). */
-  readonly subId: string
+  readonly subId: SubscriptionId
   /** The filters this subscription requested. */
   readonly filters: ReadonlyArray<NostrFilter>
   /** Current state of the subscription. */

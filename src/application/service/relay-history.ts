@@ -1,4 +1,4 @@
-import type { EventId, NostrFilter, RelayUrl } from "@innis/nostr-core"
+import type { EventId, NostrFilter, RelayUrl, SubscriptionId } from "@innis/nostr-core"
 import type { WallClock } from "../port/clock.ts"
 import type { PublishOutcome } from "../../domain/value-object/publish-history.ts"
 
@@ -8,7 +8,7 @@ import type { PublishOutcome } from "../../domain/value-object/publish-history.t
  * consumers see the read-only {@link RelaySubscriptionEntry} projection.
  */
 export interface SubHistoryRecord {
-  readonly subId: string
+  readonly subId: SubscriptionId
   readonly filters: ReadonlyArray<NostrFilter>
   readonly openedAt: number
   closedAt: number | null
@@ -28,7 +28,7 @@ export interface PublishHistoryRecord {
   message: string
 }
 
-export type SubHistoryMap = Map<RelayUrl, Map<string, SubHistoryRecord>>
+export type SubHistoryMap = Map<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>
 
 // Per-relay diagnostic ring buffers — recent activity for inspection, not an audit log. The two
 // caps are equal but separate: they bound different things (publishes trim wholesale; subscriptions
@@ -39,7 +39,7 @@ export const SUB_HISTORY_LIMIT = 100
 export interface RecordSubHistoryInput {
   readonly subHistory: SubHistoryMap
   readonly url: RelayUrl
-  readonly subId: string
+  readonly subId: SubscriptionId
   readonly filters: ReadonlyArray<NostrFilter>
   readonly openedAt: number
 }
@@ -47,7 +47,7 @@ export interface RecordSubHistoryInput {
 // Evict the oldest *closed* entries (Map iteration is insertion order) until back within the
 // limit. Active and pending subscriptions are never dropped — their history is still live — so a
 // relay holding more than `SUB_HISTORY_LIMIT` open subscriptions stays above the cap by design.
-const pruneClosedSubHistory = (entries: Map<string, SubHistoryRecord>): void => {
+const pruneClosedSubHistory = (entries: Map<SubscriptionId, SubHistoryRecord>): void => {
   if (entries.size <= SUB_HISTORY_LIMIT) return
   for (const [subId, entry] of entries) {
     if (entries.size <= SUB_HISTORY_LIMIT) return
@@ -68,9 +68,9 @@ export const recordSubHistory = (
 }
 
 export interface CloseSubHistoryInput {
-  readonly subHistory: ReadonlyMap<RelayUrl, Map<string, SubHistoryRecord>>
+  readonly subHistory: ReadonlyMap<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>
   readonly url: RelayUrl
-  readonly subId: string
+  readonly subId: SubscriptionId
   readonly clock: WallClock
 }
 
@@ -100,7 +100,7 @@ export const recordPublishEntry = (
 // untouched — the diagnostic-reset counterpart to recordSubHistory. Keeps all history-store
 // mutation in this module rather than letting callers reach into the maps directly.
 export const clearClosedSubHistory = (
-  subHistory: ReadonlyMap<RelayUrl, Map<string, SubHistoryRecord>>,
+  subHistory: ReadonlyMap<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>,
   url: RelayUrl,
 ): void => {
   const entries = subHistory.get(url)

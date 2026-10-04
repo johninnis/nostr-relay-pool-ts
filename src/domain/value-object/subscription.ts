@@ -16,7 +16,7 @@ export interface Subscription {
 }
 
 /**
- * Handle returned by {@link RelayPool.subscribeMany}. `unsubscribe()` closes every per-relay
+ * Handle returned by {@link RelayPool.subscribeMany} and {@link RelayPool.subscribeManyLive}. `unsubscribe()` closes every per-relay
  * connection the fan-out opened. `syncUrls(...)` swaps the connected URL set in place — URLs
  * dropped from the new list are closed, URLs added are opened.
  */
@@ -25,15 +25,6 @@ export interface PoolSubscription {
   readonly unsubscribe: () => void
   /** Swap the connected relay set in place: drop legs not in `urls`, open legs newly listed. */
   readonly syncUrls: (urls: ReadonlyArray<string>) => void
-}
-
-/**
- * Options for {@link RelayPool.subscribeMany}. `persistent` (default `false`) keeps each per-relay
- * leg open for live events after its EOSE instead of closing it once the stored backlog drains.
- */
-export interface SubscribeManyOptions {
-  /** Keep each leg open for live events after its EOSE instead of closing it once the backlog drains. */
-  readonly persistent?: boolean
 }
 
 /**
@@ -57,13 +48,17 @@ export interface RelaySubscribeCallbacks {
   /** Fires per event delivered, with the relay that sent it. */
   readonly onEvent: (event: NostrEvent, url: RelayUrl) => void
   /** Fires once at end-of-stored-events; the subscription stays open for live events. */
-  readonly onEose?: () => void
+  readonly onEose?: (() => void) | undefined
   /** Terminal signal — fires once when the subscription is dead and will not be revived. */
-  readonly onClosed?: (reason: string) => void
+  readonly onClosed?: ((reason: string) => void) | undefined
 }
 
-/** Callbacks for the multi-relay {@link RelayPool.subscribeMany} fan-out. */
-export interface SubscribeCallbacks {
+/**
+ * Callbacks for a multi-relay {@link RelayPool.subscribeMany} or {@link RelayPool.subscribeManyLive} fan-out: the
+ * NIP-01 `EVENT`, `EOSE` and `CLOSED` messages of one subscription, as {@link RelaySubscribeCallbacks} receives them
+ * from one relay, each naming the relay it came from.
+ */
+export interface SubscribeManyCallbacks {
   /** Fires per event delivered by any relay in the set, with the relay that sent it. */
   readonly onEvent: (event: NostrEvent, url: RelayUrl) => void
   /** Fires once per relay when that relay reaches end-of-stored-events. */

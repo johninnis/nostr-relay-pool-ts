@@ -1,5 +1,6 @@
 import { assertEquals } from "@std/assert"
-import { parseEventId, parseRelayUrl } from "@innis/nostr-core"
+import { eventIdFixture, relayUrlFixture, subscriptionIdFixture } from "@innis/nostr-core/testing"
+import type { SubscriptionId } from "@innis/nostr-core"
 import type { PublishHistoryRecord, SubHistoryRecord } from "../src/application/service/relay-history.ts"
 import type { BackoffTracker } from "../src/application/service/backoff-tracker.ts"
 import {
@@ -8,8 +9,15 @@ import {
   computeRelayStatus,
 } from "../src/infrastructure/web-socket/pool-state-projection.ts"
 import { stubRelayState, stubWireSub } from "./_helpers/relay-state.ts"
+import { FakeWebSocket } from "./_helpers/fake-web-socket.ts"
 
-const historyEntry = (overrides: Partial<SubHistoryRecord> & { subId: string }): SubHistoryRecord => ({
+const SUB_1_ID = subscriptionIdFixture("s1")
+const ACTIVE1 = subscriptionIdFixture("active1")
+const PENDING1 = subscriptionIdFixture("pending1")
+const ORPHAN = subscriptionIdFixture("orphan")
+const CLOSED = subscriptionIdFixture("closed")
+
+const historyEntry = (overrides: Partial<SubHistoryRecord> & { subId: SubscriptionId }): SubHistoryRecord => ({
   filters: [{ kinds: [1] }],
   openedAt: 1000,
   closedAt: null,
@@ -17,23 +25,22 @@ const historyEntry = (overrides: Partial<SubHistoryRecord> & { subId: string }):
   ...overrides,
 })
 
-const url = parseRelayUrl("wss://relay.example.com")
+const url = relayUrlFixture("wss://relay.example.com")
 
-// deno-lint-ignore innis/no-type-assertions -- minimal WebSocket stand-in; only readyState is read.
-const socketInState = (readyState: number): WebSocket => ({ readyState } as unknown as WebSocket)
+const socketInState = (readyState: number): WebSocket => new FakeWebSocket(readyState)
 
 Deno.test("buildRelaySubscriptions - subs in state.subs render as active", () => {
-  const state = stubRelayState({ subs: new Map([["s1", stubWireSub()]]) })
+  const state = stubRelayState({ subs: new Map([[SUB_1_ID, stubWireSub()]]) })
   const subs = buildRelaySubscriptions(url, {
     connections: new Map([[url, state]]),
-    subHistory: new Map([[url, new Map([["s1", historyEntry({ subId: "s1" })]])]]),
+    subHistory: new Map([[url, new Map([[SUB_1_ID, historyEntry({ subId: SUB_1_ID })]])]]),
   })
   assertEquals(subs.length, 1)
   assertEquals(subs[0]?.status, "active")
 })
 
 Deno.test("buildRelaySubscriptions - subs in state.pendingSubs render as pending", () => {
-  const state = stubRelayState({ pendingSubs: new Map([["s1", stubWireSub()]]) })
+  const state = stubRelayState({ pendingSubs: new Map([[SUB_1_ID, stubWireSub()]]) })
   const subs = buildRelaySubscriptions(url, {
     connections: new Map([[url, state]]),
     subHistory: new Map(),
@@ -43,7 +50,7 @@ Deno.test("buildRelaySubscriptions - subs in state.pendingSubs render as pending
 })
 
 Deno.test("buildRelaySubscriptions - subs in state.pendingAuthSubs render as pending", () => {
-  const state = stubRelayState({ pendingAuthSubs: new Map([["s1", stubWireSub()]]) })
+  const state = stubRelayState({ pendingAuthSubs: new Map([[SUB_1_ID, stubWireSub()]]) })
   const subs = buildRelaySubscriptions(url, {
     connections: new Map([[url, state]]),
     subHistory: new Map(),
@@ -53,7 +60,7 @@ Deno.test("buildRelaySubscriptions - subs in state.pendingAuthSubs render as pen
 })
 
 Deno.test("buildRelaySubscriptions - disconnected relay with open history entries renders them as pending", () => {
-  const history = new Map([["s1", historyEntry({ subId: "s1", closedAt: null })]])
+  const history = new Map([[SUB_1_ID, historyEntry({ subId: SUB_1_ID, closedAt: null })]])
   const subs = buildRelaySubscriptions(url, {
     connections: new Map(),
     subHistory: new Map([[url, history]]),
@@ -64,7 +71,7 @@ Deno.test("buildRelaySubscriptions - disconnected relay with open history entrie
 })
 
 Deno.test("buildRelaySubscriptions - history entries with closedAt render as closed", () => {
-  const history = new Map([["s1", historyEntry({ subId: "s1", closedAt: 2000 })]])
+  const history = new Map([[SUB_1_ID, historyEntry({ subId: SUB_1_ID, closedAt: 2000 })]])
   const subs = buildRelaySubscriptions(url, {
     connections: new Map(),
     subHistory: new Map([[url, history]]),
@@ -136,7 +143,7 @@ Deno.test("buildPoolState - emits a connected entry for every relay in connectio
 })
 
 Deno.test("buildPoolState - emits a disconnected entry for relays only in attemptedRelays", () => {
-  const otherUrl = parseRelayUrl("wss://seen-only.example.com")
+  const otherUrl = relayUrlFixture("wss://seen-only.example.com")
   const entries = buildPoolState({
     connections: new Map(),
     attemptedRelays: new Set([otherUrl]),
@@ -154,7 +161,7 @@ Deno.test("buildPoolState - emits a disconnected entry for relays only in attemp
 })
 
 Deno.test("buildPoolState - emits a disabled disconnected entry for backoff-disabled URLs not in connections or seen", () => {
-  const disabled = parseRelayUrl("wss://disabled.example.com")
+  const disabled = relayUrlFixture("wss://disabled.example.com")
   const entries = buildPoolState({
     connections: new Map(),
     attemptedRelays: new Set(),
@@ -175,8 +182,8 @@ Deno.test("buildPoolState - emits a disabled disconnected entry for backoff-disa
 })
 
 Deno.test("buildPoolState - preserves insertion order and does not rank by event count", () => {
-  const u1 = parseRelayUrl("wss://low.example.com")
-  const u2 = parseRelayUrl("wss://high.example.com")
+  const u1 = relayUrlFixture("wss://low.example.com")
+  const u2 = relayUrlFixture("wss://high.example.com")
   const entries = buildPoolState({
     connections: new Map(),
     attemptedRelays: new Set([u1, u2]),
@@ -203,7 +210,7 @@ Deno.test("buildPoolState - publishCount is the lifetime tally, not the capped h
     // History is a capped ring (here a single retained entry); the count must come from the
     // monotonic tally instead, so a relay past the history limit still reports its true total.
     publishHistory: new Map<typeof url, ReadonlyArray<PublishHistoryRecord>>([
-      [url, [{ eventId: parseEventId("e".repeat(64)), kind: 1, publishedAt: 1000, result: "ok", message: "" }]],
+      [url, [{ eventId: eventIdFixture("e".repeat(64)), kind: 1, publishedAt: 1000, result: "ok", message: "" }]],
     ]),
     relayEventCounts: new Map(),
     relayPublishCounts: new Map([[url, 250]]),
@@ -215,22 +222,22 @@ Deno.test("buildPoolState - publishCount is the lifetime tally, not the capped h
 
 Deno.test("buildRelaySubscriptions - active, pending, and closed can coexist for one relay", () => {
   const state = stubRelayState({
-    subs: new Map([["active1", stubWireSub()]]),
-    pendingSubs: new Map([["pending1", stubWireSub()]]),
+    subs: new Map([[ACTIVE1, stubWireSub()]]),
+    pendingSubs: new Map([[PENDING1, stubWireSub()]]),
   })
   const history = new Map([
-    ["active1", historyEntry({ subId: "active1" })],
-    ["pending1", historyEntry({ subId: "pending1" })],
-    ["orphan", historyEntry({ subId: "orphan", closedAt: null })],
-    ["closed", historyEntry({ subId: "closed", closedAt: 2000 })],
+    [ACTIVE1, historyEntry({ subId: ACTIVE1 })],
+    [PENDING1, historyEntry({ subId: PENDING1 })],
+    [ORPHAN, historyEntry({ subId: ORPHAN, closedAt: null })],
+    [CLOSED, historyEntry({ subId: CLOSED, closedAt: 2000 })],
   ])
   const subs = buildRelaySubscriptions(url, {
     connections: new Map([[url, state]]),
     subHistory: new Map([[url, history]]),
   })
   const byStatus = new Map(subs.map((s) => [s.subId, s.status]))
-  assertEquals(byStatus.get("active1"), "active")
-  assertEquals(byStatus.get("pending1"), "pending")
-  assertEquals(byStatus.get("orphan"), "pending")
-  assertEquals(byStatus.get("closed"), "closed")
+  assertEquals(byStatus.get(ACTIVE1), "active")
+  assertEquals(byStatus.get(PENDING1), "pending")
+  assertEquals(byStatus.get(ORPHAN), "pending")
+  assertEquals(byStatus.get(CLOSED), "closed")
 })

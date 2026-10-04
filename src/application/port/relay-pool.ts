@@ -6,31 +6,50 @@ import type { RelaySubscriptionEntry } from "../../domain/value-object/relay-sub
 import type {
   PoolSubscription,
   RelaySubscribeCallbacks,
-  SubscribeCallbacks,
-  SubscribeManyOptions,
+  SubscribeManyCallbacks,
   Subscription,
 } from "../../domain/value-object/subscription.ts"
 
 /**
  * The Nostr relay pool: WebSocket subscriptions, publishes, NIP-42 AUTH, backoff, and latency
  * tracking across many relays. Every URL-shaped argument takes a raw `string`, normalised internally
- * via `@innis/nostr-core`'s `normaliseRelayUrl`. Construct one with {@link createRelayPool}.
+ * via `@innis/nostr-core`'s `parseRelayUrl`. Construct one with {@link createRelayPool}.
  */
 export interface RelayPool {
-  /** Open a single-relay subscription; returns a {@link Subscription} handle. */
+  /**
+   * Open a single-relay subscription; returns a {@link Subscription} handle. A filter that can match nothing is not
+   * sent, and a subscription none of whose filters can match anything opens no connection: it ends its stored events
+   * on a microtask and never delivers an event.
+   */
   readonly subscribe: (
     rawUrl: string,
     filters: ReadonlyArray<NostrFilter>,
     callbacks: RelaySubscribeCallbacks,
   ) => Subscription
-  /** Fan a subscription out across many relays; returns a {@link PoolSubscription} handle. */
+  /**
+   * Fetch stored events from many relays; returns a {@link PoolSubscription} handle. Each relay's leg closes once that
+   * relay reaches end-of-stored-events, or at its adaptive timeout. For a feed that stays open, use
+   * {@link RelayPool.subscribeManyLive}.
+   */
   readonly subscribeMany: (
     rawUrls: ReadonlyArray<string>,
     filters: ReadonlyArray<NostrFilter>,
-    callbacks: SubscribeCallbacks,
-    options?: SubscribeManyOptions,
+    callbacks: SubscribeManyCallbacks,
   ) => PoolSubscription
-  /** Publish one event to one relay; resolves once the relay replies or the publish times out. */
+  /**
+   * Open a live subscription across many relays; returns a {@link PoolSubscription} handle. Each relay's leg stays open
+   * for live events after its end-of-stored-events, until `unsubscribe()` or the relay closes it.
+   */
+  readonly subscribeManyLive: (
+    rawUrls: ReadonlyArray<string>,
+    filters: ReadonlyArray<NostrFilter>,
+    callbacks: SubscribeManyCallbacks,
+  ) => PoolSubscription
+  /**
+   * Publish one event to one relay; resolves with that relay's outcome once it replies, the publish times out, or the
+   * socket is torn down. It never rejects for a relay or transport reason: a refusal, a timeout, a drop, an unparseable
+   * URL, a relay it cannot connect to and a disposed pool all resolve with `ok: false` and a `message` saying which.
+   */
   readonly publish: (rawUrl: string, event: NostrEvent) => Promise<PublishResponse>
   /** Relays with a currently open socket. */
   readonly getConnectedRelayUrls: () => ReadonlyArray<RelayUrl>
@@ -59,6 +78,6 @@ export interface RelayPool {
   readonly onConnectionChange: (listener: (url: RelayUrl, connected: boolean) => void) => () => void
   /** Adaptive EOSE timeout (ms) for the relay, derived from its observed latency. */
   readonly suggestedTimeout: (rawUrl: string) => number
-  /** Close every socket, cancel every timer, drop every listener, and reject further calls. Idempotent. */
+  /** Close every socket, cancel every timer and drop every listener; later subscribes are inactive and later publishes resolve `"disposed"`. Idempotent. */
   readonly dispose: () => void
 }

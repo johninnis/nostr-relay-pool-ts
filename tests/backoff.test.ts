@@ -1,13 +1,13 @@
 import { assertEquals } from "@std/assert"
 import type { RelayUrl } from "@innis/nostr-core"
-import { parseRelayUrl } from "@innis/nostr-core"
+import { relayUrlFixture } from "@innis/nostr-core/testing"
 import type { BackoffRecord } from "../src/domain/value-object/backoff-record.ts"
 import type { BackoffPersistence } from "../src/application/port/backoff-persistence.ts"
-import { systemWallClock } from "../src/infrastructure/adapter/system-wall-clock-adapter.ts"
+import { systemWallClock } from "../src/infrastructure/time/system-wall-clock.ts"
 import { createBackoffTracker } from "../src/application/service/backoff-tracker.ts"
 
-const url = parseRelayUrl("wss://example.com")
-const other = parseRelayUrl("wss://other.example.com")
+const url = relayUrlFixture("wss://example.com")
+const other = relayUrlFixture("wss://other.example.com")
 const noop = (): void => {}
 
 const createRecordingPersistence = (): BackoffPersistence & {

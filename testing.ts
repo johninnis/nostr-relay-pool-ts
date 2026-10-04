@@ -7,8 +7,8 @@
  *
  * @module
  */
-import type { NostrEvent, NostrFilter, RelayUrl } from "@innis/nostr-core"
-import { isRecord, matchesAnyFilter, parseNostrEvent, parseRelayUrl, tryParseJson } from "@innis/nostr-core"
+import type { CompiledFilter, NostrEvent, NostrFilter, RelayUrl } from "@innis/nostr-core"
+import { compileFilters, isOk, isRecord, parseJson, parseNostrEvent, parseRelayUrl } from "@innis/nostr-core"
 
 // Self-contained close so this reference relay reaches into no package internals. close() throws on
 // some platforms once the socket is already torn down; nothing is recoverable, so swallow it.
@@ -28,7 +28,7 @@ interface StoredEvent {
 
 interface ClientSubscription {
   readonly subId: string
-  readonly filters: ReadonlyArray<NostrFilter>
+  readonly filter: CompiledFilter
 }
 
 /** A running in-memory relay. Returned by {@link createInMemoryRelay}. */
@@ -59,7 +59,10 @@ export interface InMemoryRelayOptions {
   readonly port?: number
   /** Delay (ms) before each `EOSE` is sent, to simulate stored-event latency. Default: 0. */
   readonly eoseDelayMs?: number
-  /** When `true`, REQs are answered with a NIP-42 auth challenge until the socket authenticates. */
+  /**
+   * When `true`, REQs are refused with `auth-required:` and a NIP-42 challenge until the socket sends
+   * an `AUTH` event, which is accepted with `OK true` without checking it.
+   */
   readonly requireAuth?: boolean
 }
 
@@ -91,7 +94,7 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
     for (const [ws, subs] of subscriptions) {
       if (ws === exclude) continue
       for (const sub of subs.values()) {
-        if (matchesAnyFilter(event, sub.filters)) send(ws, ["EVENT", sub.subId, event])
+        if (sub.filter.matches(event)) send(ws, ["EVENT", sub.subId, event])
       }
     }
   }
@@ -109,10 +112,11 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
       subs = new Map()
       subscriptions.set(ws, subs)
     }
-    subs.set(subId, { subId, filters })
+    const filter = compileFilters(filters)
+    subs.set(subId, { subId, filter })
 
     for (const { event } of events.values()) {
-      if (matchesAnyFilter(event, filters)) {
+      if (filter.matches(event)) {
         send(ws, ["EVENT", subId, event])
       }
     }
@@ -137,16 +141,17 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
   }
 
   const handleMessage = (ws: WebSocket, raw: string): void => {
-    const data = tryParseJson(raw)
+    const parsed = parseJson(raw)
+    if (!isOk(parsed)) return
+    const data = parsed.value
     if (!Array.isArray(data) || data.length < 2) return
 
     const type = data[0]
     if (typeof type !== "string") return
 
     if (type === "REQ" && data.length >= 3 && typeof data[1] === "string") {
-      // Wire filters are untyped JSON; drop any non-object entries before trusting them. matchesFilter
+      // Wire filters are untyped JSON; drop any non-object entries before trusting them. compileFilters
       // reads every field defensively, so narrowing the surviving records to NostrFilter is sound.
-      // deno-lint-ignore innis/no-type-assertions
       const filters = data.slice(2).filter(isRecord) as ReadonlyArray<NostrFilter>
       handleReq(ws, data[1], filters)
       return
@@ -164,7 +169,10 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
     }
 
     if (type === "AUTH" && data[1]) {
+      const event = parseNostrEvent(data[1])
+      if (!event) return
       authedSockets.add(ws)
+      send(ws, ["OK", event.id, true, ""])
       return
     }
   }
@@ -229,7 +237,9 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
 
   return {
     get url() {
-      return parseRelayUrl(`ws://127.0.0.1:${actualPort}`)
+      const url = parseRelayUrl(`ws://127.0.0.1:${actualPort}`)
+      if (url === null) throw new Error(`In-memory relay has no URL before start() binds a port (port ${actualPort})`)
+      return url
     },
     get port() {
       return actualPort

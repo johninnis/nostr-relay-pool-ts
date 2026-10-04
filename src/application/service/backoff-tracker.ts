@@ -31,8 +31,8 @@ export interface BackoffTracker {
 export interface BackoffTrackerOptions {
   readonly onChange: () => void
   readonly clock: WallClock
-  readonly initial?: ReadonlyArray<BackoffRecord>
-  readonly persistence?: BackoffPersistence
+  readonly initial?: ReadonlyArray<BackoffRecord> | undefined
+  readonly persistence?: BackoffPersistence | undefined
 }
 
 export const createBackoffTracker = (options: BackoffTrackerOptions): BackoffTracker => {

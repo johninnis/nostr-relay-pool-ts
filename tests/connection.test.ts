@@ -1,13 +1,12 @@
 import { assertEquals } from "@std/assert"
 import type { NostrEvent, NostrFilter } from "@innis/nostr-core"
-import { parseRelayUrl } from "@innis/nostr-core"
-import { buildEventFixture } from "@innis/nostr-core/testing"
+import { buildEventFixture, relayUrlFixture } from "@innis/nostr-core/testing"
 import { createInMemoryRelay } from "../testing.ts"
 import type { ConnectionPool } from "../src/application/port/connection-pool.ts"
-import { systemScheduler } from "../src/infrastructure/adapter/system-scheduler-adapter.ts"
+import { systemScheduler } from "../src/infrastructure/time/system-scheduler.ts"
 import type { RelaySubscribeCallbacks } from "../src/domain/value-object/subscription.ts"
 import { createRelayConnection } from "../src/application/service/relay-connection.ts"
-import { createRelayPool } from "../src/infrastructure/adapter/web-socket-relay-pool-adapter.ts"
+import { createRelayPool } from "../src/infrastructure/web-socket/web-socket-relay-pool.ts"
 import { createManualTime } from "./_helpers/scheduler.ts"
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -262,7 +261,7 @@ Deno.test("createRelayConnection: a relay CLOSED surfaces onRelayClosed and tear
   createRelayConnection({
     pool: stubPool,
     scheduler: systemScheduler,
-    url: parseRelayUrl("wss://relay.example.com"),
+    url: relayUrlFixture("wss://relay.example.com"),
     filters: [{ kinds: [1] }],
     hardTimeoutMs: HARD_TIMEOUT_MS,
     persistent: true,

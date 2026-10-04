@@ -1,10 +1,12 @@
 import type { RelayUrl } from "@innis/nostr-core"
-import { errorMessage } from "@innis/nostr-core"
 import type { BackoffTracker } from "../../application/service/backoff-tracker.ts"
 import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler } from "../../application/port/scheduler.ts"
 import type { RelayState } from "./relay-state.ts"
 import {
+  abandonAuth,
+  cancelPendingSubTimeout,
+  cancelPendingSubTimeouts,
   closeIntentionally,
   createRelayState,
   hasAnySubs,
@@ -14,7 +16,7 @@ import {
   transferPendingState,
 } from "./relay-state.ts"
 import { handleRelayMessage, type MessageContext } from "./relay-message-handler.ts"
-import { clearAllTimers, clearTimerEntry, isOpen, isOpenOrConnecting } from "./web-socket-helpers.ts"
+import { isOpen, isOpenOrConnecting, sendKeepalive } from "./web-socket-helpers.ts"
 
 export interface PendingReconnect {
   /**
@@ -33,6 +35,7 @@ export interface SocketManagerDeps {
   readonly backoff: BackoffTracker
   readonly stableConnectionMs: number
   readonly idleSocketTimeoutMs: number
+  readonly heartbeatIntervalMs: number
   readonly connections: Map<RelayUrl, RelayState>
   readonly pendingReconnects: Map<RelayUrl, PendingReconnect>
   readonly attemptedRelays: Set<RelayUrl>
@@ -64,12 +67,12 @@ const reopenSubs = (scheduler: Scheduler, clock: WallClock, state: RelayState): 
   for (const [subId, sub] of state.pendingSubs) {
     reissueReq({ ws, subId, sub, clock })
     state.subs.set(subId, sub)
-    clearTimerEntry(scheduler, state.pendingSubTimeouts, subId)
+    cancelPendingSubTimeout(state, scheduler, subId)
   }
   state.pendingSubs.clear()
   // A sub parked awaiting AUTH when the socket dropped must be re-issued too. Re-sending the REQ
   // re-triggers the relay's auth-required CLOSED (which re-parks it) and a fresh AUTH challenge;
-  // once AUTH completes sendAuthedQueue flushes it. Without this it strands on every reconnect.
+  // once the relay accepts the AUTH the parked sub is flushed. Without this it strands on every reconnect.
   promoteAuthedSubs(state, clock)
 }
 
@@ -80,6 +83,7 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
     backoff,
     stableConnectionMs,
     idleSocketTimeoutMs,
+    heartbeatIntervalMs,
     connections,
     pendingReconnects,
     attemptedRelays,
@@ -146,12 +150,24 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
     }, idleSocketTimeoutMs)
   }
 
+  // Deliberate: an idle connection is kept alive with a periodic CLOSE, not a WebSocket ping — see ADR-0005
+  const scheduleHeartbeat = (state: RelayState, ws: WebSocket): void => {
+    if (heartbeatIntervalMs <= 0) return
+    state.heartbeatTimer = scheduler.setTimer(() => {
+      state.heartbeatTimer = null
+      if (state.ws !== ws || !isOpen(ws)) return
+      sendKeepalive(ws)
+      scheduleHeartbeat(state, ws)
+    }, heartbeatIntervalMs)
+  }
+
   const attachSocket = (state: RelayState, ws: WebSocket, url: RelayUrl): void => {
     ws.onopen = (): void => {
       state.connectedAt = clock()
       invalidateCache()
       emitConnectionChange(url, true)
       reopenSubs(scheduler, clock, state)
+      scheduleHeartbeat(state, ws)
       state.stabilityTimer = scheduler.setTimer(() => {
         state.stabilityTimer = null
         backoff.recordSuccess(url)
@@ -170,13 +186,20 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
         scheduler.clearTimer(state.idleTimer)
         state.idleTimer = null
       }
+      if (state.heartbeatTimer !== null) {
+        scheduler.clearTimer(state.heartbeatTimer)
+        state.heartbeatTimer = null
+      }
       // The pending-sub watchdogs belong to this now-dead socket. Left armed they would fire against
       // the shared subscription history and prematurely close a sub the reconnect re-establishes; a
       // revived socket re-sends every pending sub on open, so there is nothing left to time out here.
-      clearAllTimers(scheduler, state.pendingSubTimeouts)
+      cancelPendingSubTimeouts(state, scheduler)
       state.connectedAt = null
       state.authed = false
-      state.authingChallenge = null
+      state.challenge = null
+      state.answeredChallenge = null
+      state.authDeclined = false
+      abandonAuth(state, scheduler)
       if (connections.get(url) === state) connections.delete(url)
       invalidateCache()
       emitConnectionChange(url, false)
@@ -222,7 +245,7 @@ export const createSocketManager = (deps: SocketManagerDeps): SocketManager => {
     try {
       state.ws = new WebSocket(url)
     } catch (err) {
-      backoff.recordFailure(url, { code: null, reason: errorMessage(err) })
+      backoff.recordFailure(url, { code: null, reason: err instanceof Error ? err.message : String(err) })
       return null
     }
 

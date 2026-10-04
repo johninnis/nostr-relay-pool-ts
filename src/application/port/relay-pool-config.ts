@@ -19,7 +19,7 @@ export interface RelayPoolConfig {
   readonly clock?: WallClock
   /** Timer source. Default: {@link systemScheduler}. */
   readonly scheduler?: Scheduler
-  /** How long a publish waits for its relay `OK` before timing out (ms). Default: 8000. */
+  /** How long a publish waits for its relay `OK` before timing out (ms); suspended while it is parked for AUTH. Default: 8000. */
   readonly publishTimeoutMs?: number
   /** How long a sub may wait for the socket to open before it is dropped (ms). Default: 30000. */
   readonly pendingSubTimeoutMs?: number
@@ -30,11 +30,22 @@ export interface RelayPoolConfig {
   /** Upper bound on a `subscribeMany` leg's wait for EOSE before forced teardown (ms). Default: 12000. */
   readonly relayConnectionHardTimeoutMs?: number
   /**
-   * How long the NIP-42 {@link AuthHandler} may take to produce a signed AUTH event before the
-   * challenge is abandoned (ms). Generous by default because auth handlers often have a human in
-   * the loop (a NIP-07 prompt, a remote NIP-46 approval); the bound exists so a hung handler can
-   * never strand auth-parked subscriptions indefinitely — the relay's next challenge retries.
-   * Default: 60000.
+   * How long the connection's NIP-42 auth timer runs (ms). It runs while an AUTH answer is in flight —
+   * the {@link AuthHandler} producing a signed AUTH event and the relay answering it with `OK` — or
+   * while `auth-required` work is parked, and restarts with each answer. When it fires the answer is
+   * abandoned and parked publishes and subscriptions are settled with `auth-required: auth timed out`.
+   * Generous by default because auth handlers often have a human in the loop (a NIP-07 prompt, a
+   * remote NIP-46 approval). Default: 60000.
    */
   readonly authTimeoutMs?: number
+  /**
+   * How often an open connection sends `["CLOSE", "keepalive"]` so a relay's idle timeout does not
+   * drop a quiet subscriber (ms). `0` disables the heartbeat. Default: 30000.
+   */
+  readonly heartbeatIntervalMs?: number
+  /**
+   * Largest relay message the pool reads, in UTF-8 bytes. A longer frame is dropped unread, as a frame that is not a
+   * relay message is, and the connection stays open. Default: 262144 (256 KiB).
+   */
+  readonly maxMessageBytes?: number
 }

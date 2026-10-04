@@ -11,19 +11,16 @@ export const stubRelayState = (overrides: Partial<RelayState> = {}): RelayState 
   ...overrides,
 })
 
-// Build an in-flight publish record with an already-cleared timer handle, so a test that never
-// settles it leaks no pending op. Callers override `settle` to observe dispatch.
-export const stubInFlightPublish = (event: NostrEvent, overrides: Partial<InFlightPublish> = {}): InFlightPublish => {
-  const timeoutId = setTimeout(() => {}, 0)
-  clearTimeout(timeoutId)
-  return {
-    event,
-    resolvers: new Set(),
-    settle: () => {},
-    timeoutId,
-    ...overrides,
-  }
-}
+// Build an in-flight publish record with no timer, so a test that never settles it leaks no pending
+// op. Callers override `settle` to observe dispatch.
+export const stubInFlightPublish = (event: NostrEvent, overrides: Partial<InFlightPublish> = {}): InFlightPublish => ({
+  event,
+  resolvers: new Set(),
+  settle: () => {},
+  suspendTimeout: () => {},
+  restartTimeout: () => {},
+  ...overrides,
+})
 
 export const stubWireSub = (overrides: Partial<WireSub> = {}): WireSub => {
   const filters: ReadonlyArray<NostrFilter> = overrides.filters ?? [{ kinds: [1] }]

@@ -15,7 +15,7 @@ export interface PublishResponse {
   readonly from: RelayUrl | null
   /** `true` if the relay accepted the event (`OK true`). */
   readonly ok: boolean
-  /** The relay's `OK` message, or a pool-supplied reason (`"timeout"`, `"disconnected"`, `"invalid url"`). */
+  /** The relay's `OK` message, or the pool's reason (`"timeout"`, `"disconnected"`, `"invalid url"`, `"failed to connect"`, `"disposed"`). */
   readonly message: string
 }
 

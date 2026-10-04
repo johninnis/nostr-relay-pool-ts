@@ -220,8 +220,8 @@ Deno.test("in-memory relay - clear removes all events", async () => {
   const relay = createInMemoryRelay()
   await relay.start()
 
-  relay.inject(buildEventFixture())
-  relay.inject(buildEventFixture())
+  relay.inject(buildEventFixture({ content: "one" }))
+  relay.inject(buildEventFixture({ content: "two" }))
   assertEquals(relay.getStoredEvents().length, 2)
 
   relay.clear()
@@ -253,6 +253,31 @@ Deno.test("in-memory relay - cross-client event broadcast", async () => {
 
   ws1.close()
   ws2.close()
+  await delay(50)
+  await relay.stop()
+})
+
+Deno.test("in-memory relay - answers an AUTH event with OK and then serves the REQ it refused", async () => {
+  const relay = createInMemoryRelay({ requireAuth: true })
+  await relay.start()
+
+  const ws = await connectWs(relay.url)
+  const messages = collectMessages(ws)
+  ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
+  await delay(50)
+  assertEquals(messages[0], ["CLOSED", "sub1", "auth-required: authentication required"])
+  assertEquals(messages[1], ["AUTH", "challenge"])
+
+  const auth = buildEventFixture({ kind: 22242 })
+  ws.send(JSON.stringify(["AUTH", auth]))
+  await delay(50)
+  assertEquals(messages[2], ["OK", auth.id, true, ""])
+
+  ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
+  await delay(50)
+  assertEquals(messages[3], ["EOSE", "sub1"])
+
+  ws.close()
   await delay(50)
   await relay.stop()
 })

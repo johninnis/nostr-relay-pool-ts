@@ -1,16 +1,16 @@
-import type { NostrEvent, NostrFilter, RelayUrl } from "@innis/nostr-core"
-import { normaliseRelayUrl } from "@innis/nostr-core"
+import type { NostrEvent, NostrFilter, RelayUrl, SubscriptionId } from "@innis/nostr-core"
+import { parseRelayUrl } from "@innis/nostr-core"
 import type { AuthHandler } from "../../application/port/auth-handler.ts"
 import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler } from "../../application/port/scheduler.ts"
-import { systemWallClock } from "./system-wall-clock-adapter.ts"
-import { systemScheduler } from "./system-scheduler-adapter.ts"
+import { systemWallClock } from "../time/system-wall-clock.ts"
+import { systemScheduler } from "../time/system-scheduler.ts"
 import type { ConnectionPool } from "../../application/port/connection-pool.ts"
 import type { RelayPool } from "../../application/port/relay-pool.ts"
 import type { RelayPoolConfig } from "../../application/port/relay-pool-config.ts"
 import { createBackoffTracker } from "../../application/service/backoff-tracker.ts"
 import { createLatencyTracker } from "../../application/service/latency-tracker.ts"
-import { createSubscribeMany } from "../../application/service/subscribe-many.ts"
+import { createSubscribeMany, createSubscribeManyLive } from "../../application/service/subscribe-many.ts"
 import {
   clearClosedSubHistory,
   type PublishHistoryRecord,
@@ -21,19 +21,19 @@ import type { PublishHistoryEntry, PublishResponse } from "../../domain/value-ob
 import type { RelayPoolStateEntry } from "../../domain/value-object/relay-pool-state-entry.ts"
 import type { RelaySubscriptionEntry } from "../../domain/value-object/relay-subscription.ts"
 import type { RelaySubscribeCallbacks, Subscription } from "../../domain/value-object/subscription.ts"
-import { createPublish } from "../web-socket/publish.ts"
-import { createSubscribe, INACTIVE_SUBSCRIPTION } from "../web-socket/subscribe.ts"
-import { createSocketManager, type PendingReconnect } from "../web-socket/socket-manager.ts"
-import { closeIntentionally, findWireSub, tearDownSubs } from "../web-socket/relay-state.ts"
-import type { RelayState } from "../web-socket/relay-state.ts"
+import { createPublish } from "./publish.ts"
+import { createSubscribe, INACTIVE_SUBSCRIPTION } from "./subscribe.ts"
+import { createSocketManager, type PendingReconnect } from "./socket-manager.ts"
+import { abandonAuth, closeIntentionally, findWireSub, tearDownSubs } from "./relay-state.ts"
+import type { RelayState } from "./relay-state.ts"
 import {
   buildPoolState,
   buildRelayPublishHistory,
   buildRelaySubscriptions,
   type PoolSnapshot,
-} from "../web-socket/pool-state-projection.ts"
-import type { MessageContext } from "../web-socket/relay-message-handler.ts"
-import { isOpen } from "../web-socket/web-socket-helpers.ts"
+} from "./pool-state-projection.ts"
+import type { MessageContext } from "./relay-message-handler.ts"
+import { isOpen } from "./web-socket-helpers.ts"
 
 const DEFAULT_STABLE_CONNECTION_MS = 30_000
 const DEFAULT_IDLE_SOCKET_TIMEOUT_MS = 30_000
@@ -41,6 +41,8 @@ const DEFAULT_PUBLISH_TIMEOUT_MS = 8_000
 const DEFAULT_PENDING_SUB_TIMEOUT_MS = 30_000
 const DEFAULT_RELAY_CONNECTION_HARD_TIMEOUT_MS = 12_000
 const DEFAULT_AUTH_TIMEOUT_MS = 60_000
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000
+const DEFAULT_MAX_MESSAGE_BYTES = 262_144
 
 /**
  * Construct a {@link RelayPool} backed by the host's `WebSocket`. The sole entry point of the
@@ -58,6 +60,8 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   const relayConnectionHardTimeoutMs = config.relayConnectionHardTimeoutMs ??
     DEFAULT_RELAY_CONNECTION_HARD_TIMEOUT_MS
   const authTimeoutMs = config.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS
+  const heartbeatIntervalMs = config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
+  const maxMessageBytes = config.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
 
   const connections = new Map<RelayUrl, RelayState>()
   const relayEventCounts = new Map<RelayUrl, number>()
@@ -113,6 +117,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     subHistory,
     authHandler: () => authHandler,
     authTimeoutMs,
+    maxMessageBytes,
     clock,
     scheduler,
     onEventReceived: incrementEventCount,
@@ -126,6 +131,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     backoff,
     stableConnectionMs,
     idleSocketTimeoutMs,
+    heartbeatIntervalMs,
     connections,
     pendingReconnects,
     attemptedRelays,
@@ -138,7 +144,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   // The state owning a sub is usually the live connection, but a relay that dropped mid-sub parks
   // its state on the pending reconnect — and a fresh subscribe during the backoff window can put a
   // new live state alongside it, so ownership is decided by which state actually holds the subId.
-  const findOwningState = (url: RelayUrl, subId: string): RelayState | undefined => {
+  const findOwningState = (url: RelayUrl, subId: SubscriptionId): RelayState | undefined => {
     const live = connections.get(url)
     if (live && findWireSub(live, subId)) return live
     const parked = pendingReconnects.get(url)?.state
@@ -170,21 +176,21 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   })
 
   // Public boundary: normalise the raw URL once, then hand the branded RelayUrl to the core
-  // subscribe. The internal fan-out (subscribeMany) already holds RelayUrls and calls the core
-  // directly, so a relay URL is normalised exactly once on the way in.
+  // subscribe. The internal fan-outs (subscribeMany, subscribeManyLive) already hold RelayUrls and
+  // call the core directly, so a relay URL is normalised exactly once on the way in.
   const subscribeByRawUrl = (
     rawUrl: string,
     filters: ReadonlyArray<NostrFilter>,
     callbacks: RelaySubscribeCallbacks,
   ): Subscription => {
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (!url) return INACTIVE_SUBSCRIPTION
     return subscribe(url, filters, callbacks)
   }
 
   const publishByRawUrl = (rawUrl: string, event: NostrEvent): Promise<PublishResponse> => {
     if (disposed) return Promise.resolve({ from: null, ok: false, message: "disposed" })
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (!url) return Promise.resolve({ from: null, ok: false, message: "invalid url" })
     return publish(url, event)
   }
@@ -219,13 +225,13 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   }
 
   const getRelaySubscriptions = (rawUrl: string): ReadonlyArray<RelaySubscriptionEntry> => {
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (!url) return []
     return buildRelaySubscriptions(url, { connections, subHistory })
   }
 
   const getRelayPublishHistory = (rawUrl: string): ReadonlyArray<PublishHistoryEntry> => {
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (!url) return []
     return buildRelayPublishHistory(url, { publishHistory })
   }
@@ -245,7 +251,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   }
 
   const clearDisabled = (rawUrl: string): void => {
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (!url) return
     backoff.clear(url)
     // A relay that dropped while it still had subscriptions sits in pendingReconnects: fire its
@@ -267,7 +273,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   }
 
   const disconnect = (rawUrl: string): void => {
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (!url) return
     // A relay that dropped while it still had subscriptions sits in pendingReconnects with no live
     // socket; without cancelling that timer the pool would silently revive a relay the caller just
@@ -298,7 +304,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   }
 
   const clearRelayHistory = (rawUrl: string): void => {
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (!url) return
     clearClosedSubHistory(subHistory, url)
     retainPendingPublishHistory(publishHistory, url)
@@ -317,7 +323,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   const suggestedTimeoutByUrl = (url: RelayUrl): number => latencyTracker.suggestedTimeout(url)
 
   const suggestedTimeout = (rawUrl: string): number => {
-    const url = normaliseRelayUrl(rawUrl)
+    const url = parseRelayUrl(rawUrl)
     if (url === null) return latencyTracker.defaultTimeoutMs
     return suggestedTimeoutByUrl(url)
   }
@@ -327,11 +333,9 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     suggestedTimeout: suggestedTimeoutByUrl,
   }
 
-  const subscribeMany = createSubscribeMany({
-    connectionPool,
-    scheduler,
-    hardTimeoutMs: relayConnectionHardTimeoutMs,
-  })
+  const fanOutDeps = { connectionPool, scheduler, hardTimeoutMs: relayConnectionHardTimeoutMs }
+  const subscribeMany = createSubscribeMany(fanOutDeps)
+  const subscribeManyLive = createSubscribeManyLive(fanOutDeps)
 
   const dispose = (): void => {
     if (disposed) return
@@ -346,6 +350,11 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
         scheduler.clearTimer(state.idleTimer)
         state.idleTimer = null
       }
+      if (state.heartbeatTimer !== null) {
+        scheduler.clearTimer(state.heartbeatTimer)
+        state.heartbeatTimer = null
+      }
+      abandonAuth(state, scheduler)
       settleInFlightPublishes(state, "disposed")
       closeIntentionally(state)
     }
@@ -366,6 +375,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   return Object.freeze({
     subscribe: subscribeByRawUrl,
     subscribeMany,
+    subscribeManyLive,
     publish: publishByRawUrl,
     getConnectedRelayUrls,
     getAttemptedRelayUrls,

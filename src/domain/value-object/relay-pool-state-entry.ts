@@ -15,7 +15,7 @@ export interface RelayPoolStateEntry {
   readonly url: RelayUrl
   /** Connection state — the single source of truth for connectedness. */
   readonly status: RelayStatus
-  /** Whether a NIP-42 AUTH handshake has completed on the live socket. */
+  /** Whether the relay has accepted a NIP-42 AUTH event (`OK true`) on the live socket. */
   readonly authed: boolean
   /** Wall-clock time (ms since epoch) the backoff cooldown lifts, or `null` when not in cooldown. */
   readonly disabledUntil: number | null

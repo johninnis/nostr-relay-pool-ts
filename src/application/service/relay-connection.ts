@@ -24,8 +24,8 @@ export interface CreateRelayConnectionInput {
 
 interface RequestState {
   closed: boolean
-  softTimeoutId?: TimerHandle
-  hardTimeoutId?: TimerHandle
+  softTimeoutId?: TimerHandle | undefined
+  hardTimeoutId?: TimerHandle | undefined
 }
 
 const NOOP_HANDLE: RelayConnectionHandle = Object.freeze({ unsubscribe: (): void => {} })

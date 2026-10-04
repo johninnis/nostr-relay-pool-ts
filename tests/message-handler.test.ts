@@ -1,47 +1,13 @@
 import { assertEquals } from "@std/assert"
+import { subscriptionIdFixture } from "@innis/nostr-core/testing"
 import type { NostrEvent } from "@innis/nostr-core"
-import { parseEventId, parsePublicKey, parseRelayUrl, parseSig } from "@innis/nostr-core"
-import { systemWallClock } from "../src/infrastructure/adapter/system-wall-clock-adapter.ts"
-import { systemScheduler } from "../src/infrastructure/adapter/system-scheduler-adapter.ts"
-import type { MessageContext } from "../src/infrastructure/web-socket/relay-message-handler.ts"
 import { handleRelayMessage } from "../src/infrastructure/web-socket/relay-message-handler.ts"
-import type { RelayState } from "../src/infrastructure/web-socket/relay-state.ts"
 import type { SubHistoryRecord } from "../src/application/service/relay-history.ts"
 import type { PublishAck } from "../src/infrastructure/web-socket/relay-state.ts"
-import type { WireSub } from "../src/infrastructure/web-socket/wire-sub.ts"
 import { stubInFlightPublish, stubRelayState, stubWireSub } from "./_helpers/relay-state.ts"
-import { createManualTime } from "./_helpers/scheduler.ts"
+import { context, event, message, URL, wireSubWith } from "./_helpers/message.ts"
 
-const URL = parseRelayUrl("wss://relay.example.com")
-
-const event = (overrides: Partial<NostrEvent> = {}): NostrEvent => ({
-  id: parseEventId("a".repeat(64)),
-  pubkey: parsePublicKey("b".repeat(64)),
-  created_at: 1700000000,
-  kind: 1,
-  tags: [],
-  content: "hello",
-  sig: parseSig("c".repeat(128)),
-  ...overrides,
-})
-
-const context = (state: RelayState, partial: Partial<MessageContext> = {}): MessageContext => ({
-  state,
-  url: URL,
-  subHistory: new Map(),
-  authHandler: () => null,
-  authTimeoutMs: 60_000,
-  clock: systemWallClock,
-  scheduler: systemScheduler,
-  onEventReceived: () => {},
-  onEoseLatency: () => {},
-  onStateChange: () => {},
-  ...partial,
-})
-
-const wireSubWith = (listeners: WireSub["listeners"]): WireSub => stubWireSub({ listeners })
-
-const message = (payload: unknown): MessageEvent => new MessageEvent("message", { data: JSON.stringify(payload) })
+const SUB_1 = subscriptionIdFixture("sub-1")
 
 Deno.test("handleRelayMessage - ignores a non-JSON payload", () => {
   const state = stubRelayState()
@@ -58,7 +24,7 @@ Deno.test("handleRelayMessage - delivers a matching EVENT to subscription listen
   const received: NostrEvent[] = []
   const state = stubRelayState()
   state.subs.set(
-    "sub-1",
+    SUB_1,
     wireSubWith(
       [{
         onEvent: (e) => {
@@ -67,7 +33,7 @@ Deno.test("handleRelayMessage - delivers a matching EVENT to subscription listen
       }],
     ),
   )
-  handleRelayMessage(context(state), message(["EVENT", "sub-1", event()]))
+  handleRelayMessage(context(state), message(["EVENT", SUB_1, event()]))
   assertEquals(received.length, 1)
 })
 
@@ -75,7 +41,7 @@ Deno.test("handleRelayMessage - drops an EVENT that does not match the filter", 
   const received: NostrEvent[] = []
   const state = stubRelayState()
   state.subs.set(
-    "sub-1",
+    SUB_1,
     wireSubWith(
       [{
         onEvent: (e) => {
@@ -84,7 +50,7 @@ Deno.test("handleRelayMessage - drops an EVENT that does not match the filter", 
       }],
     ),
   )
-  handleRelayMessage(context(state), message(["EVENT", "sub-1", event({ kind: 7 })]))
+  handleRelayMessage(context(state), message(["EVENT", SUB_1, event({ kind: 7 })]))
   assertEquals(received.length, 0)
 })
 
@@ -113,10 +79,10 @@ Deno.test("handleRelayMessage - fires onEose once for an EOSE message", () => {
       },
     }],
   )
-  state.subs.set("sub-1", sub)
+  state.subs.set(SUB_1, sub)
   const ctx = context(state)
-  handleRelayMessage(ctx, message(["EOSE", "sub-1"]))
-  handleRelayMessage(ctx, message(["EOSE", "sub-1"]))
+  handleRelayMessage(ctx, message(["EOSE", SUB_1]))
+  handleRelayMessage(ctx, message(["EOSE", SUB_1]))
   assertEquals(eoseCalls, 1)
   assertEquals(sub.eoseFired, true)
 })
@@ -126,9 +92,9 @@ Deno.test("handleRelayMessage - EOSE latency is measured from reqSentAt, not the
   const state = stubRelayState()
   // Simulate a sub that was first issued long ago but re-issued (reconnect/auth) one tick before
   // this EOSE: latency must reflect the live request, not the whole gap since the first subscribe.
-  state.subs.set("sub-1", stubWireSub({ reqSentAt: 990 }))
+  state.subs.set(SUB_1, stubWireSub({ reqSentAt: 990 }))
   const ctx = context(state, { clock: () => 1000, onEoseLatency: (_url, ms) => samples.push(ms) })
-  handleRelayMessage(ctx, message(["EOSE", "sub-1"]))
+  handleRelayMessage(ctx, message(["EOSE", SUB_1]))
   assertEquals(samples, [10])
 })
 
@@ -153,23 +119,12 @@ Deno.test("handleRelayMessage - dispatches the OK ack to the publish settlement"
   assertEquals(state.inFlightPublishes.size, 0)
 })
 
-Deno.test("handleRelayMessage - queues an event for auth retry on an auth-required OK", () => {
-  const state = stubRelayState()
-  const pending = event()
-  state.inFlightPublishes.set(pending.id, stubInFlightPublish(pending))
-  handleRelayMessage(context(state), message(["OK", pending.id, false, "auth-required: please AUTH"]))
-  assertEquals(state.pendingAuthPublish.length, 1)
-  assertEquals(state.pendingAuthPublish[0], pending)
-  // The in-flight record stays put — its timeout keeps running until AUTH completes or it expires.
-  assertEquals(state.inFlightPublishes.size, 1)
-})
-
 Deno.test("handleRelayMessage - removes a subscription on a CLOSED message", () => {
   const state = stubRelayState()
-  state.subs.set("sub-1", stubWireSub())
-  state.subIdByFilterHash.set("hash", "sub-1")
-  handleRelayMessage(context(state), message(["CLOSED", "sub-1", "shutting down"]))
-  assertEquals(state.subs.has("sub-1"), false)
+  state.subs.set(SUB_1, stubWireSub())
+  state.subIdByFilterHash.set("hash", SUB_1)
+  handleRelayMessage(context(state), message(["CLOSED", SUB_1, "shutting down"]))
+  assertEquals(state.subs.has(SUB_1), false)
   assertEquals(state.subIdByFilterHash.size, 0)
 })
 
@@ -177,10 +132,10 @@ Deno.test("handleRelayMessage - fires onClosed with the reason on a non-auth CLO
   const reasons: string[] = []
   const state = stubRelayState()
   const sub = wireSubWith([{ onEvent: () => {}, onClosed: (reason) => reasons.push(reason) }])
-  state.subs.set("sub-1", sub)
-  handleRelayMessage(context(state), message(["CLOSED", "sub-1", "rate-limited: slow down"]))
+  state.subs.set(SUB_1, sub)
+  handleRelayMessage(context(state), message(["CLOSED", SUB_1, "rate-limited: slow down"]))
   assertEquals(reasons, ["rate-limited: slow down"])
-  assertEquals(state.subs.has("sub-1"), false)
+  assertEquals(state.subs.has(SUB_1), false)
 })
 
 Deno.test("handleRelayMessage - a non-auth CLOSED does not fire onEose", () => {
@@ -188,120 +143,67 @@ Deno.test("handleRelayMessage - a non-auth CLOSED does not fire onEose", () => {
   let closedCalls = 0
   const state = stubRelayState()
   const sub = wireSubWith([{ onEvent: () => {}, onEose: () => eoseCalls++, onClosed: () => closedCalls++ }])
-  state.subs.set("sub-1", sub)
-  handleRelayMessage(context(state), message(["CLOSED", "sub-1", "shutting down"]))
+  state.subs.set(SUB_1, sub)
+  handleRelayMessage(context(state), message(["CLOSED", SUB_1, "shutting down"]))
   assertEquals(eoseCalls, 0)
   assertEquals(closedCalls, 1)
 })
 
-Deno.test("handleRelayMessage - an auth-required CLOSED fires neither onEose nor onClosed", () => {
-  let eoseCalls = 0
-  let closedCalls = 0
-  const state = stubRelayState()
-  const sub = wireSubWith([{ onEvent: () => {}, onEose: () => eoseCalls++, onClosed: () => closedCalls++ }])
-  state.subs.set("sub-1", sub)
-  handleRelayMessage(context(state), message(["CLOSED", "sub-1", "auth-required: restricted"]))
-  assertEquals(eoseCalls, 0)
-  assertEquals(closedCalls, 0)
-  assertEquals(state.pendingAuthSubs.has("sub-1"), true)
-})
-
-Deno.test("handleRelayMessage - re-queues a subscription closed with auth-required", () => {
-  const state = stubRelayState()
-  state.subs.set("sub-1", stubWireSub())
-  handleRelayMessage(context(state), message(["CLOSED", "sub-1", "auth-required: restricted"]))
-  assertEquals(state.subs.has("sub-1"), false)
-  assertEquals(state.pendingAuthSubs.has("sub-1"), true)
-})
-
-Deno.test("handleRelayMessage - an auth-required CLOSED clears authed so a re-challenge can re-auth", () => {
-  const state = stubRelayState()
-  state.authed = true
-  state.subs.set("sub-1", stubWireSub())
-  handleRelayMessage(context(state), message(["CLOSED", "sub-1", "auth-required: restricted"]))
-  assertEquals(state.authed, false)
-  assertEquals(state.pendingAuthSubs.has("sub-1"), true)
-})
-
 Deno.test("handleRelayMessage - increments the event count in subscription history", () => {
   const state = stubRelayState()
-  state.subs.set("sub-1", stubWireSub({ listeners: [{ onEvent: () => {} }] }))
+  state.subs.set(SUB_1, stubWireSub({ listeners: [{ onEvent: () => {} }] }))
   const entry: SubHistoryRecord = {
-    subId: "sub-1",
+    subId: SUB_1,
     filters: [{ kinds: [1] }],
     openedAt: 0,
     closedAt: null,
     eventCount: 0,
   }
-  const subHistory = new Map([[URL, new Map([["sub-1", entry]])]])
-  handleRelayMessage(context(state, { subHistory }), message(["EVENT", "sub-1", event()]))
+  const subHistory = new Map([[URL, new Map([[SUB_1, entry]])]])
+  handleRelayMessage(context(state, { subHistory }), message(["EVENT", SUB_1, event()]))
   assertEquals(entry.eventCount, 1)
 })
 
-const openSocket = (sent: string[]): WebSocket =>
-  // deno-lint-ignore innis/no-type-assertions -- minimal WebSocket stand-in; only readyState and send are used.
-  ({
-    readyState: WebSocket.OPEN,
-    send: (data: string) => {
-      sent.push(data)
-    },
-  }) as unknown as WebSocket
+const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length
 
-const flushMicrotasks = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+const eventFrameOfBytes = (bytes: number, filler = "x"): MessageEvent => {
+  const frameWith = (content: string): string => JSON.stringify(["EVENT", SUB_1, event({ content })])
+  const room = bytes - utf8Bytes(frameWith(""))
+  const repeated = filler.repeat(Math.floor(room / utf8Bytes(filler)))
+  const data = frameWith(repeated + "x".repeat(room - utf8Bytes(repeated)))
+  assertEquals(utf8Bytes(data), bytes)
+  return new MessageEvent("message", { data })
+}
 
-Deno.test("handleRelayMessage - abandons a hung auth handler after authTimeoutMs so a re-challenge can retry", async () => {
-  const errors: unknown[] = []
-  const onError = (e: ErrorEvent): void => {
-    e.preventDefault()
-    errors.push(e.error)
-  }
-  globalThis.addEventListener("error", onError)
-  try {
-    const time = createManualTime()
-    const state = stubRelayState({ ws: openSocket([]) })
-    let handlerCalls = 0
-    const ctx = context(state, {
-      clock: time.clock,
-      scheduler: time.scheduler,
-      authHandler: () => () => {
-        handlerCalls++
-        return new Promise<NostrEvent | null>(() => {})
+const deliveredCount = (frame: MessageEvent, maxMessageBytes: number): number => {
+  let delivered = 0
+  const state = stubRelayState()
+  state.subs.set(
+    SUB_1,
+    wireSubWith([{
+      onEvent: () => {
+        delivered++
       },
-    })
+    }]),
+  )
+  handleRelayMessage(context(state, { maxMessageBytes }), frame)
+  return delivered
+}
 
-    handleRelayMessage(ctx, message(["AUTH", "challenge-1"]))
-    assertEquals(handlerCalls, 1)
-    assertEquals(state.authingChallenge, "challenge-1")
-
-    time.tick(60_000)
-    await flushMicrotasks()
-
-    assertEquals(state.authingChallenge, null, "the timed-out challenge must be released")
-    assertEquals(state.authed, false)
-    assertEquals(errors.length, 1, "the timeout must surface to the host process")
-
-    handleRelayMessage(ctx, message(["AUTH", "challenge-1"]))
-    assertEquals(handlerCalls, 2, "a re-challenge after the timeout must invoke the handler again")
-    await flushMicrotasks()
-  } finally {
-    globalThis.removeEventListener("error", onError)
-  }
+Deno.test("handleRelayMessage - delivers a frame of exactly maxMessageBytes", () => {
+  assertEquals(deliveredCount(eventFrameOfBytes(1_000), 1_000), 1)
 })
 
-Deno.test("handleRelayMessage - clears the auth timeout timer when the handler resolves in time", async () => {
-  const time = createManualTime()
-  const sent: string[] = []
-  const state = stubRelayState({ ws: openSocket(sent) })
-  const ctx = context(state, {
-    clock: time.clock,
-    scheduler: time.scheduler,
-    authHandler: () => () => Promise.resolve(event({ kind: 22242 })),
-  })
+Deno.test("handleRelayMessage - drops a frame one byte over maxMessageBytes", () => {
+  assertEquals(deliveredCount(eventFrameOfBytes(1_001), 1_000), 0)
+})
 
-  handleRelayMessage(ctx, message(["AUTH", "challenge-1"]))
-  await flushMicrotasks()
+Deno.test("handleRelayMessage - drops a frame over maxMessageBytes in UTF-8 bytes though under it in UTF-16 code units", () => {
+  const frame = eventFrameOfBytes(1_001, "\u20ac")
+  assertEquals(frame.data.length < 1_000, true)
+  assertEquals(deliveredCount(frame, 1_000), 0)
+})
 
-  assertEquals(state.authed, true)
-  assertEquals(sent.length, 1, "the signed AUTH event must be sent")
-  assertEquals(time.pendingCount(), 0, "the timeout timer must be cleared once the handler settles")
+Deno.test("handleRelayMessage - delivers a multi-byte frame of exactly maxMessageBytes", () => {
+  assertEquals(deliveredCount(eventFrameOfBytes(1_000, "\u20ac"), 1_000), 1)
 })
