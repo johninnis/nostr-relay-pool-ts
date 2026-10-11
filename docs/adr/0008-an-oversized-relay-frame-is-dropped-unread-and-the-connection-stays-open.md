@@ -22,3 +22,4 @@ innis/nostr-client bounds every inbound frame at 256 KiB, and its WebSocket pars
 - An oversized `OK` or `CLOSED` is lost like any malformed one: the publish it answered times out, the subscription it closed stays open until the pool's own timeouts end it.
 - A host that reads relays serving larger events, such as long-form articles with inline media or very large contact lists, raises `maxMessageBytes`.
 - Do not close the connection on an oversized frame to match innis/nostr-client: here a close is followed by a reconnect that asks for the same frame again.
+- Shared decision: nostr-adrs ADR-0102.

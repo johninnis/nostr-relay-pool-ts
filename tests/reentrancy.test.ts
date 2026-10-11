@@ -1,121 +1,109 @@
 import { assertEquals } from "@std/assert"
 import type { NostrEvent } from "@innis/nostr-core"
 import { buildEventFixture } from "@innis/nostr-core/testing"
+import type { RelayPool } from "../src/application/port/relay-pool.ts"
 import { createRelayPool } from "../src/infrastructure/web-socket/web-socket-relay-pool.ts"
-import { createInMemoryRelay } from "../testing.ts"
+import { createInMemoryRelay, type InMemoryRelay } from "../testing.ts"
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-// A callback that re-enters the pool during dispatch must not corrupt the listener array being
-// walked. Listener arrays are copy-on-write — never mutated in place, only replaced — and `for...of`
-// evaluates `wireSub.listeners` once, so an add/remove from inside a callback swaps in a new array
-// without changing who receives the current event.
-
-Deno.test("re-entrancy: subscribing from inside onEvent does not replay the in-flight event to the new listener", async () => {
+const withPool = async <T>(act: (relay: InMemoryRelay, pool: RelayPool) => Promise<T>): Promise<T> => {
   const relay = createInMemoryRelay()
   await relay.start()
   const pool = createRelayPool()
   try {
-    const lateReceived: Array<NostrEvent> = []
-    let joined = false
+    return await act(relay, pool)
+  } finally {
+    pool.dispose()
+    await relay.stop()
+  }
+}
 
-    // The first listener, on its first event, subscribes a second listener onto the *same* filter
-    // hash — which adds to the wire sub's live listener set. Without a snapshot the new listener is
-    // visited in the same dispatch and wrongly replays the in-flight event, breaking the documented
-    // "a late joiner sees only events from the moment it joined onward" contract.
+const inFlightEvent = (): NostrEvent => buildEventFixture({ kind: 1, content: "in flight" })
+
+const nextEvent = (): NostrEvent => buildEventFixture({ kind: 1, content: "next" })
+
+const deliverInFlightThenNext = async (relay: InMemoryRelay, inFlight: NostrEvent, next: NostrEvent): Promise<void> => {
+  await delay(200)
+  relay.inject(inFlight)
+  await delay(200)
+  relay.inject(next)
+  await delay(200)
+}
+
+Deno.test("re-entrancy: subscribing from inside onEvent does not replay the in-flight event to the new listener", async () => {
+  const next = nextEvent()
+  const lateJoinerIds = await withPool(async (relay, pool) => {
+    const received: Array<string> = []
+    let joined = false
     pool.subscribe(relay.url, [{ kinds: [1] }], {
       onEvent: () => {
         if (joined) return
         joined = true
         pool.subscribe(relay.url, [{ kinds: [1] }], {
           onEvent: (e) => {
-            lateReceived.push(e)
+            received.push(e.id)
           },
         })
       },
     })
-
-    await delay(200)
-    relay.inject(buildEventFixture({ kind: 1 }))
-    await delay(200)
-
-    assertEquals(joined, true, "first listener should have re-entered subscribe")
-    assertEquals(lateReceived.length, 0, "late joiner must not receive the event in flight when it joined")
-
-    const future = buildEventFixture({ kind: 1 })
-    relay.inject(future)
-    await delay(200)
-
-    assertEquals(lateReceived.length, 1, "late joiner should receive events emitted after it joined")
-    assertEquals(lateReceived[0]?.id, future.id)
-  } finally {
-    pool.dispose()
-    await relay.stop()
-  }
+    await deliverInFlightThenNext(relay, inFlightEvent(), next)
+    return received
+  })
+  assertEquals(lateJoinerIds, [next.id])
 })
 
-Deno.test("re-entrancy: unsubscribing from inside onEvent still delivers the in-flight event to remaining listeners", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-  const pool = createRelayPool()
-  try {
-    const firstReceived: Array<NostrEvent> = []
-    const secondReceived: Array<NostrEvent> = []
+interface SelfRemovalDuringDispatch {
+  readonly leaverIds: ReadonlyArray<string>
+  readonly remainingIds: ReadonlyArray<string>
+}
 
-    // The first listener removes itself mid-dispatch. The second listener shares the same wire sub
-    // and sits after the first in the listener array, so it must still receive the in-flight event.
-    const first = pool.subscribe(relay.url, [{ kinds: [1] }], {
+const unsubscribeFromInsideOnEvent = (inFlight: NostrEvent, next: NostrEvent): Promise<SelfRemovalDuringDispatch> =>
+  withPool(async (relay, pool) => {
+    const leaverIds: Array<string> = []
+    const remainingIds: Array<string> = []
+    const leaver = pool.subscribe(relay.url, [{ kinds: [1] }], {
       onEvent: (e) => {
-        firstReceived.push(e)
-        first.unsubscribe()
+        leaverIds.push(e.id)
+        leaver.unsubscribe()
       },
     })
     pool.subscribe(relay.url, [{ kinds: [1] }], {
       onEvent: (e) => {
-        secondReceived.push(e)
+        remainingIds.push(e.id)
       },
     })
+    await deliverInFlightThenNext(relay, inFlight, next)
+    return { leaverIds, remainingIds }
+  })
 
-    await delay(200)
-    relay.inject(buildEventFixture({ kind: 1 }))
-    await delay(200)
+Deno.test("re-entrancy: unsubscribing from inside onEvent still delivers the in-flight event to remaining listeners", async () => {
+  const inFlight = inFlightEvent()
+  const next = nextEvent()
+  const { remainingIds } = await unsubscribeFromInsideOnEvent(inFlight, next)
+  assertEquals(remainingIds, [inFlight.id, next.id])
+})
 
-    assertEquals(firstReceived.length, 1)
-    assertEquals(secondReceived.length, 1, "remaining listener must still receive the in-flight event")
-
-    relay.inject(buildEventFixture({ kind: 1 }))
-    await delay(200)
-
-    assertEquals(firstReceived.length, 1, "unsubscribed listener must receive no further events")
-    assertEquals(secondReceived.length, 2)
-  } finally {
-    pool.dispose()
-    await relay.stop()
-  }
+Deno.test("re-entrancy: a listener that unsubscribes inside onEvent receives no further events", async () => {
+  const inFlight = inFlightEvent()
+  const { leaverIds } = await unsubscribeFromInsideOnEvent(inFlight, nextEvent())
+  assertEquals(leaverIds, [inFlight.id])
 })
 
 Deno.test("re-entrancy: synchronous unsubscribe suppresses the late joiner's synthetic EOSE", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-  const pool = createRelayPool()
-  try {
+  const eose = await withPool(async (relay, pool) => {
     pool.subscribe(relay.url, [{ kinds: [1] }], { onEvent: () => {} })
     await delay(300)
-
-    // The wire sub has already EOSE'd, so this late joiner is owed a synthetic EOSE on the next
-    // microtask — unless it leaves synchronously, in which case the membership re-check must skip it.
-    let eose = false
+    let signalled = false
     const sub = pool.subscribe(relay.url, [{ kinds: [1] }], {
       onEvent: () => {},
       onEose: () => {
-        eose = true
+        signalled = true
       },
     })
     sub.unsubscribe()
     await new Promise<void>((resolve) => queueMicrotask(resolve))
-    assertEquals(eose, false, "a listener that left synchronously must not be signalled on the microtask")
-  } finally {
-    pool.dispose()
-    await relay.stop()
-  }
+    return signalled
+  })
+  assertEquals(eose, false)
 })

@@ -17,3 +17,4 @@ A relay answers an `EVENT` with `OK`, and a refusal (`duplicate:`, `rate-limited
 - Callers inspect the outcome instead of catching errors, and every publish settles.
 - Unlike innis/nostr-client, a dropped connection is also a resolved outcome. A parked publish is settled only by the relay's verdict on the `AUTH`, a decline, the auth timeout or a dropped connection, never by `timeout` while a slow auth handler is still answering.
 - The pool's own messages carry no reason prefix, so they are never mistaken for a relay's machine-readable reason.
+- Shared decisions: nostr-adrs ADR-0001 and ADR-0030.

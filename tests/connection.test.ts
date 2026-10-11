@@ -11,18 +11,16 @@ import { createManualTime } from "./_helpers/scheduler.ts"
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 const HARD_TIMEOUT_MS = 12_000
+const CLOCK_STEP_MS = 1_000
 
-Deno.test("createRelayConnection receives events and calls onRelayEose on EOSE", async () => {
+const fetchOnce = async (stored: NostrEvent) => {
   const relay = createInMemoryRelay()
   await relay.start()
   const pool = createRelayPool()
   try {
-    const event = buildEventFixture({ kind: 1 })
-    relay.inject(event)
-
-    const received: NostrEvent[] = []
+    relay.inject(stored)
+    const receivedIds: Array<string> = []
     let completed = false
-
     createRelayConnection({
       pool,
       scheduler: createManualTime().scheduler,
@@ -31,46 +29,37 @@ Deno.test("createRelayConnection receives events and calls onRelayEose on EOSE",
       hardTimeoutMs: HARD_TIMEOUT_MS,
       callbacks: {
         onEvent: (e) => {
-          received.push(e)
+          receivedIds.push(e.id)
         },
         onRelayEose: () => {
           completed = true
         },
       },
     })
-
     await delay(300)
-
-    assertEquals(received.length, 1)
-    const [first] = received
-    if (!first) throw new Error("expected one received event")
-    assertEquals(first.id, event.id)
-    assertEquals(completed, true)
+    return { receivedIds, completed }
   } finally {
     pool.dispose()
     await relay.stop()
   }
-})
+}
 
-Deno.test("createRelayConnection fires onRelayEose at soft timeout when EOSE never arrives", async () => {
+const completionsWithoutEose = async (afterSoftTimeoutMs: number): Promise<number> => {
   const relay = createInMemoryRelay()
   await relay.start()
   const pool = createRelayPool()
   const time = createManualTime()
   try {
     let completedCount = 0
-
     const originalSubscribe = pool.subscribe.bind(pool)
     const silentPool: ConnectionPool = {
       suggestedTimeout: pool.suggestedTimeout,
-      // Drops onEose/onClosed to simulate a relay that never signals end-of-stream.
       subscribe: (
         url: string,
         filters: ReadonlyArray<NostrFilter>,
         callbacks: RelaySubscribeCallbacks,
       ) => originalSubscribe(url, filters, { onEvent: callbacks.onEvent }),
     }
-
     createRelayConnection({
       pool: silentPool,
       scheduler: time.scheduler,
@@ -84,28 +73,22 @@ Deno.test("createRelayConnection fires onRelayEose at soft timeout when EOSE nev
         },
       },
     })
-
-    // The soft timeout is the default suggested timeout (no latency samples yet).
-    time.tick(4000)
-    assertEquals(completedCount, 1)
-
-    // Advancing past the hard timeout must not fire completion a second time.
-    time.tick(HARD_TIMEOUT_MS)
-    assertEquals(completedCount, 1)
+    time.tick(silentPool.suggestedTimeout(relay.url))
+    time.tick(afterSoftTimeoutMs)
+    return completedCount
   } finally {
     pool.dispose()
     await relay.stop()
   }
-})
+}
 
-Deno.test("createRelayConnection is idempotent: late EOSE after soft timeout does not double-fire", async () => {
+const completionsAroundDelayedEose = async (waitAfterSoftTimeoutMs: number): Promise<number> => {
   const relay = createInMemoryRelay({ eoseDelayMs: 400 })
   await relay.start()
   const pool = createRelayPool({ latency: { defaultTimeoutMs: 200, maxTimeoutMs: 500 } })
   const time = createManualTime()
   try {
     let completedCount = 0
-
     createRelayConnection({
       pool,
       scheduler: time.scheduler,
@@ -119,56 +102,24 @@ Deno.test("createRelayConnection is idempotent: late EOSE after soft timeout doe
         },
       },
     })
-
     time.tick(200)
-    assertEquals(completedCount, 1, "soft timeout should have fired onRelayEose once")
-
-    await delay(600)
-    assertEquals(completedCount, 1, "late EOSE must not fire onRelayEose a second time")
+    await delay(waitAfterSoftTimeoutMs)
+    return completedCount
   } finally {
     pool.dispose()
     await relay.stop()
   }
-})
+}
 
-Deno.test("createRelayConnection records a latency sample on EOSE", async () => {
+const persistentStream = async () => {
   const relay = createInMemoryRelay()
   await relay.start()
   const pool = createRelayPool()
   try {
-    createRelayConnection({
-      pool,
-      scheduler: createManualTime().scheduler,
-      url: relay.url,
-      filters: [{ kinds: [1] }],
-      hardTimeoutMs: HARD_TIMEOUT_MS,
-      callbacks: {
-        onEvent: () => {},
-        onRelayEose: () => {},
-      },
-    })
-
-    await delay(300)
-
-    const suggested = pool.suggestedTimeout(relay.url)
-    assertEquals(suggested, 4000, "single sample should not yet adapt (below minSamples)")
-  } finally {
-    pool.dispose()
-    await relay.stop()
-  }
-})
-
-Deno.test("createRelayConnection persistent mode streams events after EOSE", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-  const pool = createRelayPool()
-  try {
-    const received: NostrEvent[] = []
+    const receivedIds: Array<string> = []
     let completed = false
-
-    const first = buildEventFixture({ kind: 1 })
-    relay.inject(first)
-
+    const stored = buildEventFixture({ kind: 1 })
+    relay.inject(stored)
     createRelayConnection({
       pool,
       scheduler: createManualTime().scheduler,
@@ -178,68 +129,27 @@ Deno.test("createRelayConnection persistent mode streams events after EOSE", asy
       persistent: true,
       callbacks: {
         onEvent: (e) => {
-          received.push(e)
+          receivedIds.push(e.id)
         },
         onRelayEose: () => {
           completed = true
         },
       },
     })
-
     await delay(300)
-    assertEquals(completed, true)
-    assertEquals(received.length, 1)
-
-    const second = buildEventFixture({ kind: 1 })
-    relay.inject(second)
+    const completedByEose = completed
+    const receivedIdsByEose = [...receivedIds]
+    const live = buildEventFixture({ kind: 1 })
+    relay.inject(live)
     await delay(300)
-
-    assertEquals(received.length, 2)
-    const last = received[1]
-    if (!last) throw new Error("expected a second received event")
-    assertEquals(last.id, second.id)
+    return { storedId: stored.id, liveId: live.id, completedByEose, receivedIdsByEose, receivedIds: [...receivedIds] }
   } finally {
     pool.dispose()
     await relay.stop()
   }
-})
+}
 
-Deno.test("createRelayConnection persistent close stops stream", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-  const pool = createRelayPool()
-  try {
-    const received: NostrEvent[] = []
-
-    const handle = createRelayConnection({
-      pool,
-      scheduler: createManualTime().scheduler,
-      url: relay.url,
-      filters: [{ kinds: [1] }],
-      hardTimeoutMs: HARD_TIMEOUT_MS,
-      persistent: true,
-      callbacks: {
-        onEvent: (e) => {
-          received.push(e)
-        },
-        onRelayEose: () => {},
-      },
-    })
-
-    await delay(200)
-    handle.unsubscribe()
-
-    relay.inject(buildEventFixture({ kind: 1 }))
-    await delay(200)
-
-    assertEquals(received.length, 0)
-  } finally {
-    pool.dispose()
-    await relay.stop()
-  }
-})
-
-Deno.test("createRelayConnection: a relay CLOSED surfaces onRelayClosed and tears down even when persistent", () => {
+const closedByRelay = () => {
   const captured: RelaySubscribeCallbacks[] = []
   let unsubscribed = false
   const stubPool: ConnectionPool = {
@@ -254,10 +164,8 @@ Deno.test("createRelayConnection: a relay CLOSED surfaces onRelayClosed and tear
       }
     },
   }
-
   const closedReasons: string[] = []
   let eoseCount = 0
-
   createRelayConnection({
     pool: stubPool,
     scheduler: systemScheduler,
@@ -275,31 +183,25 @@ Deno.test("createRelayConnection: a relay CLOSED surfaces onRelayClosed and tear
       },
     },
   })
-
   const callbacks = captured[0]
   if (!callbacks) throw new Error("subscribe was not called")
   callbacks.onClosed?.("rate-limited: slow down")
+  return { closedReasons, eoseCount, unsubscribed }
+}
 
-  assertEquals(closedReasons, ["rate-limited: slow down"])
-  // The leg completes (onRelayEose fires once for completion tracking) and the persistent
-  // connection is torn down because the subscription is dead, not merely past its backlog.
-  assertEquals(eoseCount, 1)
-  assertEquals(unsubscribed, true)
-})
-
-Deno.test("createRelayConnection close stops receiving events", async () => {
+const receivedAfterUnsubscribe = async (persistent: boolean): Promise<number> => {
   const relay = createInMemoryRelay()
   await relay.start()
   const pool = createRelayPool()
   try {
     const received: NostrEvent[] = []
-
     const handle = createRelayConnection({
       pool,
       scheduler: createManualTime().scheduler,
       url: relay.url,
       filters: [{ kinds: [1] }],
       hardTimeoutMs: HARD_TIMEOUT_MS,
+      persistent,
       callbacks: {
         onEvent: (e) => {
           received.push(e)
@@ -307,16 +209,105 @@ Deno.test("createRelayConnection close stops receiving events", async () => {
         onRelayEose: () => {},
       },
     })
-
     await delay(200)
     handle.unsubscribe()
-
     relay.inject(buildEventFixture({ kind: 1 }))
     await delay(200)
-
-    assertEquals(received.length, 0)
+    return received.length
   } finally {
     pool.dispose()
     await relay.stop()
   }
+}
+
+Deno.test("createRelayConnection delivers the stored events its filter matches", async () => {
+  const stored = buildEventFixture({ kind: 1 })
+  const { receivedIds } = await fetchOnce(stored)
+  assertEquals(receivedIds, [stored.id])
+})
+
+Deno.test("createRelayConnection calls onRelayEose on EOSE", async () => {
+  const { completed } = await fetchOnce(buildEventFixture({ kind: 1 }))
+  assertEquals(completed, true)
+})
+
+Deno.test("createRelayConnection fires onRelayEose at soft timeout when EOSE never arrives", async () => {
+  assertEquals(await completionsWithoutEose(0), 1)
+})
+
+Deno.test("createRelayConnection does not fire onRelayEose again when the hard timeout follows the soft timeout", async () => {
+  assertEquals(await completionsWithoutEose(HARD_TIMEOUT_MS), 1)
+})
+
+Deno.test("createRelayConnection fires onRelayEose at the soft timeout before a delayed EOSE arrives", async () => {
+  assertEquals(await completionsAroundDelayedEose(0), 1)
+})
+
+Deno.test("createRelayConnection is idempotent: late EOSE after soft timeout does not double-fire", async () => {
+  assertEquals(await completionsAroundDelayedEose(600), 1)
+})
+
+Deno.test("createRelayConnection records a latency sample on EOSE", async () => {
+  const relay = createInMemoryRelay()
+  await relay.start()
+  let clockMs = 0
+  const pool = createRelayPool({
+    clock: () => (clockMs += CLOCK_STEP_MS),
+    latency: { minSamples: 1, defaultTimeoutMs: 1, multiplier: 1, maxTimeoutMs: Number.MAX_SAFE_INTEGER },
+  })
+  try {
+    createRelayConnection({
+      pool,
+      scheduler: createManualTime().scheduler,
+      url: relay.url,
+      filters: [{ kinds: [1] }],
+      hardTimeoutMs: HARD_TIMEOUT_MS,
+      callbacks: {
+        onEvent: () => {},
+        onRelayEose: () => {},
+      },
+    })
+
+    await delay(300)
+
+    assertEquals(pool.suggestedTimeout(relay.url) >= CLOCK_STEP_MS, true)
+  } finally {
+    pool.dispose()
+    await relay.stop()
+  }
+})
+
+Deno.test("createRelayConnection persistent mode calls onRelayEose on EOSE", async () => {
+  const { completedByEose } = await persistentStream()
+  assertEquals(completedByEose, true)
+})
+
+Deno.test("createRelayConnection persistent mode delivers the stored events by EOSE", async () => {
+  const { storedId, receivedIdsByEose } = await persistentStream()
+  assertEquals(receivedIdsByEose, [storedId])
+})
+
+Deno.test("createRelayConnection persistent mode streams events after EOSE", async () => {
+  const { storedId, liveId, receivedIds } = await persistentStream()
+  assertEquals(receivedIds, [storedId, liveId])
+})
+
+Deno.test("createRelayConnection persistent close stops stream", async () => {
+  assertEquals(await receivedAfterUnsubscribe(true), 0)
+})
+
+Deno.test("createRelayConnection: a relay CLOSED surfaces onRelayClosed with the relay's reason", () => {
+  assertEquals(closedByRelay().closedReasons, ["rate-limited: slow down"])
+})
+
+Deno.test("createRelayConnection: a relay CLOSED completes the leg through onRelayEose even when persistent", () => {
+  assertEquals(closedByRelay().eoseCount, 1)
+})
+
+Deno.test("createRelayConnection: a relay CLOSED tears the leg down even when persistent", () => {
+  assertEquals(closedByRelay().unsubscribed, true)
+})
+
+Deno.test("createRelayConnection close stops receiving events", async () => {
+  assertEquals(await receivedAfterUnsubscribe(false), 0)
 })

@@ -18,20 +18,21 @@ import { createRelayPool } from "@innis/nostr-relay-pool"
 
 ```ts
 const pool = createRelayPool({
-  onAuthChallenge?: AuthHandler,            // (url, challenge) => Promise<NostrEvent | null>
+  onAuthChallenge?: AuthHandler,             // (url, challenge) => Promise<NostrEvent | null>
   latency?: LatencyTrackerOverrides,
   initialBackoff?: ReadonlyArray<BackoffRecord>,
   backoffPersistence?: BackoffPersistence,
-  clock?: WallClock,                        // default: () => Date.now() (ms since epoch)
-  scheduler?: Scheduler,                    // default: systemScheduler (setTimeout/clearTimeout)
-  publishTimeoutMs?: number,                // default: 8 000
-  pendingSubTimeoutMs?: number,             // default: 30 000
-  stableConnectionMs?: number,              // default: 30 000
-  idleSocketTimeoutMs?: number,             // default: 30 000
-  relayConnectionHardTimeoutMs?: number,    // default: 12 000
-  authTimeoutMs?: number,                   // default: 60 000
-  heartbeatIntervalMs?: number,             // default: 30 000; 0 disables
-  maxMessageBytes?: number,                 // default: 262 144 (256 KiB)
+  clock?: WallClock,                         // default: () => Date.now() (ms since epoch)
+  scheduler?: Scheduler,                     // default: systemScheduler (setTimeout/clearTimeout)
+  publishTimeoutMs?: number,                 // default: 8 000
+  pendingSubTimeoutMs?: number,              // default: 30 000
+  stableConnectionMs?: number,               // default: 30 000
+  idleSocketTimeoutMs?: number,              // default: 30 000
+  relayConnectionHardTimeoutMs?: number,     // default: 12 000
+  authTimeoutMs?: number,                    // default: 60 000
+  heartbeatIntervalMs?: number,              // default: 30 000; 0 disables
+  maxMessageBytes?: number,                  // default: 262 144 (256 KiB)
+  relayInformation?: RelayInformationLookup, // (url) => RelayInformation | null; default: none
 })
 ```
 
@@ -39,7 +40,7 @@ Every URL-shaped parameter on the public surface accepts a raw `string` and is n
 
 Returns a `RelayPool` with:
 
-- `subscribe(rawUrl, filters, { onEvent, onEose?, onClosed? })` — single-relay subscription. Returns `{ active, unsubscribe }`; `active` is `false` if the URL was invalid, the pool is disposed, the relay is in backoff cooldown, or the connection gate rejected the URL. `onEose` fires once at end-of-stored-events (the sub stays open for live events); `onClosed(reason)` is the terminal signal — it fires once when the sub is dead and won't be revived, whether the relay *terminated* it via a NIP-01 `CLOSED` (`reason` is the relay's message: rate-limit, shutdown, unsupported filter, or `auth-required:` when the pool cannot authenticate; an AUTH the relay refuses closes it with `auth-required: auth rejected: …`) or the pool tore it down (`reason` is `"disconnected"`, `"disposed"`, or `"connection gate rejected"`). Distinct from `onEose`, which only means the stored backlog ended. Identical filters on the same relay de-duplicate onto one wire subscription; a caller that joins after that wire sub has already EOSE'd gets a synthetic `onEose` but **not** a replay of events already delivered — subscribe before you need the backlog, or use a distinct filter. A filter that can match nothing (an empty list, a `since` after its `until`) is never sent; a subscription none of whose filters can match anything opens no connection and gets `onEose` on a microtask (ADR-0006).
+- `subscribe(rawUrl, filters, { onEvent, onEose?, onClosed? })` — single-relay subscription. Returns `{ active, unsubscribe }`; `active` is `false` if the URL was invalid, the pool is disposed, the relay is in backoff cooldown, or the connection gate rejected the URL. `onEose` fires at end-of-stored-events (the sub stays open for live events), and again each time the pool sends the sub's `REQ` again: after a reconnect, or to widen a read the relay narrowed until AUTH (ADR-0010); `onClosed(reason)` is the terminal signal — it fires once when the sub is dead and won't be revived, whether the relay *terminated* it via a NIP-01 `CLOSED` (`reason` is the relay's message: rate-limit, shutdown, unsupported filter, or `auth-required:` when the pool cannot authenticate; an AUTH the relay refuses closes it with `auth-required: auth rejected: …`) or the pool tore it down (`reason` is `"disconnected"`, `"disposed"`, or `"connection gate rejected"`). Distinct from `onEose`, which only means the stored backlog ended. Identical filters on the same relay de-duplicate onto one wire subscription; a caller that joins after that wire sub has already EOSE'd gets a synthetic `onEose` but **not** a replay of events already delivered — subscribe before you need the backlog, or use a distinct filter. A filter that can match nothing (an empty list, a `since` after its `until`) is never sent; a subscription none of whose filters can match anything opens no connection and gets `onEose` on a microtask (ADR-0006). A filter with a NIP-50 `search` is sent only to a relay whose NIP-11 document, read from `relayInformation` as the subscription opens, lists 50 in `supportedNips`; a relay whose document is unknown (`null`, or no `relayInformation` at all) or does not list 50 is sent the other filters only, and a subscription left with nothing to send is answered as one that can match nothing (ADR-0009). What a relay sends for a search is checked against the rest of its filter, not the search: the relay decides what matches it.
 - `subscribeMany(rawUrls, filters, callbacks)` — fetch stored events from many relays: each relay's leg closes at its EOSE (or its adaptive timeout). `callbacks` is `{ onEvent, onRelayEose?, onRelayClosed? }` — the subscription's `EVENT`, `EOSE` and `CLOSED` per relay, the multi-relay counterpart of `subscribe`'s callbacks. Returns `{ unsubscribe, syncUrls }`; `syncUrls(newRawUrls)` swaps the connected set in place.
 - `subscribeManyLive(rawUrls, filters, callbacks)` — the same fan-out for a live feed: each leg stays open for live events after its EOSE until `unsubscribe()` or the relay closes it.
 - `publish(rawUrl, event)` — publishes one event to one relay; resolves with `{ from, ok, message }`. It never rejects for a relay or transport reason: a refusal (`OK` false, with the relay's message), a timeout, a drop, an unparseable URL, a relay it cannot connect to and a disposed pool are all `ok: false` outcomes.
@@ -70,6 +71,7 @@ The package exposes these interfaces from `application/port/` so consumers and p
 - `BackoffPersistence` — `{ write, remove }` for persisting backoff state across reloads
 - `WallClock` — `() => number` (milliseconds-since-epoch); default `systemWallClock` is `() => Date.now()`. Distinct from `@innis/nostr-core`'s `Clock` (which returns seconds for protocol timestamps), so the two cannot be silently interchanged. This is the time the pool *reads*.
 - `Scheduler` — `{ setTimer, clearTimer }`, the one-shot timers the pool *acts on* (reconnect, backoff, stability, publish/sub timeouts); default `systemScheduler` wraps `setTimeout`/`clearTimeout`. Inject a virtual scheduler alongside a fake `WallClock` to drive every timer deterministically in tests.
+- `RelayInformationLookup` — `(url) => RelayInformation | null`, the NIP-11 document the host holds for a relay (such as one fetched with `@innis/nostr-core`'s `fetchRelayInformation`), or `null` when it holds none. The pool never fetches a document; it reads this to decide which relays are sent a filter with a `search`. Without it, no relay is sent a search.
 - `ConnectionPool` — the small slice of the pool (`subscribe`, `suggestedTimeout`) the internal subscription fan-out drives. It takes already-normalised `RelayUrl`s rather than raw strings: a relay URL is normalised exactly once, at the public boundary, then passed through internally as a branded value
 - `RelayConfig`, `RelayPool`, `RelayPoolConfig`
 
@@ -87,9 +89,9 @@ The package exposes these interfaces from `application/port/` so consumers and p
 2. The pool tracks each relay's connection and auth state, plus a stability timer (default 30 s) that fires `backoff.recordSuccess(url)` once the connection has held — so a flapping relay never gets its backoff schedule reset. A relay that dropped while it still had subscriptions is surfaced as `reconnecting` in `getRelayPoolState()` until its scheduled reconnect fires.
 3. On disconnect, the pool reconnects with exponential backoff. The reconnect lives only as long as its subscriptions do: unsubscribing the last one during the backoff window cancels it.
 4. A socket left with no subscriptions and no in-flight publishes closes after `idleSocketTimeoutMs` (default 30 s); any new subscribe or publish within the window disarms the close. A close the pool initiates is not a relay failure, so it records no backoff penalty.
-5. NIP-42 AUTH: the pool keeps the relay's latest challenge and, when an auth handler is set, answers it by calling `onAuthChallenge(url, challenge)`; the application returns a signed kind-22242 event or `null`. A publish refused with `auth-required:` and a subscription `CLOSED` with `auth-required:` are parked only while a handler can still authenticate the connection; the relay's `OK true` for the AUTH event resends the parked events and re-issues the parked subscriptions. An `auth-required:` reply to the AUTH event itself means the relay issued a fresh challenge, which the pool answers; any other refusal resolves parked publishes and closes parked subscriptions with `auth-required: auth rejected: <relay's reason>`. A handler that returns `null` declines: parked work resolves and closes with `auth-required: auth declined`. With no handler, after a decline until the relay's next challenge, or once the relay has already accepted an AUTH, an `auth-required:` refusal is the outcome. One auth timer per connection, `authTimeoutMs` (default 60 s), runs while an AUTH answer (handler plus the relay's `OK`) is in flight or work is parked, and restarts with each answer; when it fires the answer is abandoned, the relay's next challenge retries, and parked publishes resolve and parked subscriptions close with `auth-required: auth timed out`. Design records: `docs/adr/`.
+5. NIP-42 AUTH: the pool keeps the relay's latest challenge and, when an auth handler is set, answers it by calling `onAuthChallenge(url, challenge)`; the application returns a signed kind-22242 event or `null`. Every challenge frame is a new challenge, even one repeating the string of an answer still in flight: it is answered on arrival when no answer is in flight, and otherwise kept as not yet answered. A publish refused with `auth-required:` and a subscription `CLOSED` with `auth-required:` are parked only while a handler can still authenticate the connection; the relay's `OK true` for the AUTH event resends the parked events and re-issues the parked subscriptions. An `auth-required:` reply to the AUTH event itself means the relay issued a fresh challenge, which the pool answers; any other refusal resolves parked publishes and closes parked subscriptions with `auth-required: auth rejected: <relay's reason>`. A handler that returns `null` declines: parked work resolves and closes with `auth-required: auth declined`. With no handler, after a decline until the relay's next challenge, or once the relay has already accepted an AUTH, an `auth-required:` refusal is the outcome. One auth timer per connection, `authTimeoutMs` (default 60 s), runs while an AUTH answer (handler plus the relay's `OK`) is in flight or work is parked, and restarts with each answer; when it fires the answer is abandoned, the relay's next challenge retries, and parked publishes resolve and parked subscriptions close with `auth-required: auth timed out`. A subscription whose `EOSE` carries NIP-67's `"auth"` hint is a read the relay narrowed: it stays open, and once the relay accepts the pool's AUTH, before or after that `EOSE`, its `REQ` is sent again on the same id, once; the relay answers it as a new subscription, so events already delivered may arrive again and `onEose` fires again (ADR-0010). A one-shot `subscribeMany` leg has closed at its first `EOSE` by then and keeps the narrowed answer. Design records: `docs/adr/`.
 6. Publish results: relays that reply with an `OK` ack within `publishTimeoutMs` resolve the publish; otherwise it times out. While a publish is parked for AUTH its own timeout is suspended and the auth timeout bounds it; the resend starts `publishTimeoutMs` again. A publish still awaiting its ack when the socket drops settles immediately as `{ ok: false, message: "disconnected" }` rather than waiting out the timeout — the event is not re-sent on reconnect.
-7. Keep-alive: every open socket sends `["CLOSE", "keepalive"]` each `heartbeatIntervalMs` (default 30 s, `0` disables) so an idle-timeout relay does not drop a quiet subscriber, and a `NOTICE` whose text is `ping` is answered with the same frame.
+7. Keep-alive: every open socket sends `["CLOSE", "keepalive"]` each `heartbeatIntervalMs` (default 30 s, `0` disables) so an idle-timeout relay does not drop a quiet subscriber, and a `NOTICE` whose text is `ping`, ignoring case and any leading or trailing space, tab, line feed, carriage return, vertical tab or NUL, but no other whitespace, is answered with the same frame.
 8. Message size: a frame from a relay longer than `maxMessageBytes` UTF-8 bytes (default 256 KiB) is dropped before it is parsed, as a frame that is not a relay message is; the connection stays open and later frames are read. A relay that sends larger events than the default needs a host that raises it.
 9. EOSE timeouts are *adaptive* per relay — `suggestedTimeout(url)` reflects what the latency tracker has learned.
 
@@ -136,10 +138,12 @@ Deno's `sanitizeOps` / `sanitizeResources` are left **on** in every test — the
 src/
   domain/
     value-object/   — branded types, public/internal type aliases
+    service/        — pure protocol rules the pool applies
+                      (nip50-search)
   application/
     port/           — interfaces the application needs from outside
-                      (AuthHandler, BackoffPersistence, Clock, Scheduler, ConnectionPool,
-                       RelayPool, RelayConfig, RelayPoolConfig)
+                      (AuthHandler, BackoffPersistence, WallClock, Scheduler, ConnectionPool,
+                       RelayInformationLookup, RelayPool, RelayConfig, RelayPoolConfig)
     service/        — orchestration services
                       (backoff-tracker, latency-tracker, relay-history,
                        relay-config, relay-connection, subscribe-many)

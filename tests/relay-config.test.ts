@@ -36,22 +36,30 @@ const stubPool = (): RelayPool & { gates: Array<(url: RelayUrl) => boolean> } =>
 const URL_A = relayUrlFixture("wss://a.example.com")
 const URL_B = relayUrlFixture("wss://b.example.com")
 
-Deno.test("createRelayConfig - defaults are unrestricted and empty allowlist", () => {
-  const pool = stubPool()
-  const config = createRelayConfig(pool)
-  assertEquals(config.isRestrictedMode(), false)
-  assertEquals(config.getAllowedRelays(), [])
-})
-
-Deno.test("createRelayConfig - restricted + allowlist gates connections to the allowlist", () => {
+const gateRestrictedToAllowlistOfA = (): (url: RelayUrl) => boolean => {
   const pool = stubPool()
   const config = createRelayConfig(pool)
   config.setRestrictedMode(true)
   config.setAllowedRelays([URL_A])
   const gate = pool.gates.at(-1)
   if (!gate) throw new Error("expected a gate to have been applied")
-  assertEquals(gate(URL_A), true)
-  assertEquals(gate(URL_B), false)
+  return gate
+}
+
+Deno.test("createRelayConfig - defaults to unrestricted mode", () => {
+  assertEquals(createRelayConfig(stubPool()).isRestrictedMode(), false)
+})
+
+Deno.test("createRelayConfig - defaults to an empty allowlist", () => {
+  assertEquals(createRelayConfig(stubPool()).getAllowedRelays(), [])
+})
+
+Deno.test("createRelayConfig - restricted + allowlist admits a relay on the allowlist", () => {
+  assertEquals(gateRestrictedToAllowlistOfA()(URL_A), true)
+})
+
+Deno.test("createRelayConfig - restricted + allowlist refuses a relay off the allowlist", () => {
+  assertEquals(gateRestrictedToAllowlistOfA()(URL_B), false)
 })
 
 Deno.test("createRelayConfig - restricted but empty allowlist accepts everything", () => {

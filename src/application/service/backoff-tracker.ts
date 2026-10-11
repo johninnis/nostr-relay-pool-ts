@@ -83,15 +83,13 @@ export const createBackoffTracker = (options: BackoffTrackerOptions): BackoffTra
 
   const recordSuccess = (url: RelayUrl): void => {
     stepByUrl.delete(url)
-    const until = disabledUntilByUrl.get(url)
-    if (until === undefined || clock() >= until) {
+    const stillDisabledUntil = disabledUntil(url)
+    if (stillDisabledUntil === null) {
       disabledUntilByUrl.delete(url)
       lastFailureByUrl.delete(url)
       persistence?.remove(url)
     } else {
-      // Still inside the disabled window (e.g. a manual early reconnect): reset the step but keep
-      // the last failure so the persisted record stays consistent with the live disabled state.
-      persistence?.write({ url, disabledUntil: until, step: 0, lastFailure: lastFailureByUrl.get(url) })
+      persistence?.write({ url, disabledUntil: stillDisabledUntil, step: 0, lastFailure: lastFailureByUrl.get(url) })
     }
     onChange()
   }

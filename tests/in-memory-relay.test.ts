@@ -1,8 +1,11 @@
-import { assert, assertEquals, assertGreater } from "@std/assert"
-import { createInMemoryRelay } from "../testing.ts"
+import { assertEquals, assertGreater } from "@std/assert"
+import type { NostrEvent } from "@innis/nostr-core"
+import { createInMemoryRelay, type InMemoryRelay, type InMemoryRelayOptions } from "../testing.ts"
 import { buildEventFixture } from "@innis/nostr-core/testing"
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+type Frame = unknown[]
 
 const connectWs = (url: string): Promise<WebSocket> =>
   new Promise((resolve) => {
@@ -10,8 +13,8 @@ const connectWs = (url: string): Promise<WebSocket> =>
     ws.onopen = (): void => resolve(ws)
   })
 
-const collectMessages = (ws: WebSocket): Array<unknown[]> => {
-  const messages: Array<unknown[]> = []
+const collectMessages = (ws: WebSocket): Array<Frame> => {
+  const messages: Array<Frame> = []
   ws.onmessage = (msg: MessageEvent): void => {
     const data: unknown = msg.data
     if (typeof data !== "string") return
@@ -27,10 +30,85 @@ const hasStringContent = (value: unknown): value is { readonly content: string }
   return typeof content === "string"
 }
 
-const eventContent = (value: unknown): string => {
-  assert(hasStringContent(value), "expected an event with string content")
-  return value.content
+const isEventFrame = (frame: Frame): boolean => frame[0] === "EVENT"
+
+const isEoseFrame = (frame: Frame): boolean => frame[0] === "EOSE"
+
+const eventContentsOf = (frames: ReadonlyArray<Frame>): ReadonlyArray<string | null> =>
+  frames.filter(isEventFrame).map(([, , event]) => hasStringContent(event) ? event.content : null)
+
+const withRelay = async <T>(
+  options: InMemoryRelayOptions,
+  run: (relay: InMemoryRelay) => Promise<T> | T,
+): Promise<T> => {
+  const relay = createInMemoryRelay(options)
+  await relay.start()
+  try {
+    return await run(relay)
+  } finally {
+    await relay.stop()
+  }
 }
+
+const withClient = async <T>(
+  relay: InMemoryRelay,
+  run: (ws: WebSocket, frames: ReadonlyArray<Frame>) => Promise<T>,
+): Promise<T> => {
+  const ws = await connectWs(relay.url)
+  const frames = collectMessages(ws)
+  try {
+    return await run(ws, frames)
+  } finally {
+    ws.close()
+    await delay(50)
+  }
+}
+
+const publishOverSocket = (event: NostrEvent) =>
+  withRelay({}, (relay) =>
+    withClient(relay, async (ws, frames) => {
+      ws.send(JSON.stringify(["EVENT", event]))
+      await delay(100)
+      return { replies: [...frames], storedContents: relay.getStoredEvents().map((stored) => stored.content) }
+    }))
+
+const framesAnsweringReq = (
+  stored: ReadonlyArray<NostrEvent>,
+  filter: Readonly<Record<string, unknown>>,
+): Promise<ReadonlyArray<Frame>> =>
+  withRelay({}, (relay) => {
+    for (const event of stored) relay.inject(event)
+    return withClient(relay, async (ws, frames) => {
+      ws.send(JSON.stringify(["REQ", "sub1", filter]))
+      await delay(100)
+      return [...frames]
+    })
+  })
+
+const framesAfterLiveInject = (event: NostrEvent): Promise<ReadonlyArray<Frame>> =>
+  withRelay({}, (relay) =>
+    withClient(relay, async (ws, frames) => {
+      ws.send(JSON.stringify(["REQ", "live", { kinds: [1] }]))
+      await delay(50)
+      relay.inject(event)
+      await delay(100)
+      return [...frames]
+    }))
+
+const authExchange = (auth: NostrEvent) =>
+  withRelay({ requireAuth: true }, (relay) =>
+    withClient(relay, async (ws, frames) => {
+      ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
+      await delay(50)
+      const refusal = frames.slice(0)
+      ws.send(JSON.stringify(["AUTH", auth]))
+      await delay(50)
+      const authReply = frames.slice(refusal.length)
+      ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
+      await delay(50)
+      const served = frames.slice(refusal.length + authReply.length)
+      return { refusal, authReply, served }
+    }))
 
 Deno.test("in-memory relay - starts and stops", async () => {
   const relay = createInMemoryRelay()
@@ -52,232 +130,125 @@ Deno.test("in-memory relay - accepts WebSocket connections", async () => {
   await relay.stop()
 })
 
-Deno.test("in-memory relay - stores published events and responds OK", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-
-  const ws = await connectWs(relay.url)
-  const messages = collectMessages(ws)
-
+Deno.test("in-memory relay - answers a published event with OK", async () => {
   const event = buildEventFixture({ content: "hello relay" })
-  ws.send(JSON.stringify(["EVENT", event]))
-  await delay(100)
-
-  assertEquals(messages.length, 1)
-  const [okMessage] = messages
-  if (!okMessage) throw new Error("expected an OK message")
-  assertEquals(okMessage[0], "OK")
-  assertEquals(okMessage[1], event.id)
-  assertEquals(okMessage[2], true)
-
-  const storedEvents = relay.getStoredEvents()
-  assertEquals(storedEvents.length, 1)
-  const [storedEvent] = storedEvents
-  if (!storedEvent) throw new Error("expected a stored event")
-  assertEquals(storedEvent.content, "hello relay")
-
-  ws.close()
-  await delay(50)
-  await relay.stop()
+  const { replies } = await publishOverSocket(event)
+  assertEquals(replies, [["OK", event.id, true, ""]])
 })
 
-Deno.test("in-memory relay - REQ returns matching events then EOSE", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
+Deno.test("in-memory relay - stores a published event", async () => {
+  const { storedContents } = await publishOverSocket(buildEventFixture({ content: "hello relay" }))
+  assertEquals(storedContents, ["hello relay"])
+})
 
-  const event1 = buildEventFixture({ kind: 1, content: "note 1" })
-  const event2 = buildEventFixture({ kind: 0, content: "profile" })
-  relay.inject(event1)
-  relay.inject(event2)
+Deno.test("in-memory relay - REQ returns the stored events its filter matches", async () => {
+  const frames = await framesAnsweringReq(
+    [buildEventFixture({ kind: 1, content: "note 1" }), buildEventFixture({ kind: 0, content: "profile" })],
+    { kinds: [1] },
+  )
+  assertEquals(eventContentsOf(frames), ["note 1"])
+})
 
-  const ws = await connectWs(relay.url)
-  const messages = collectMessages(ws)
+Deno.test("in-memory relay - REQ ends its stored events with an EOSE for its subscription", async () => {
+  const frames = await framesAnsweringReq(
+    [buildEventFixture({ kind: 1, content: "note 1" }), buildEventFixture({ kind: 0, content: "profile" })],
+    { kinds: [1] },
+  )
+  assertEquals(frames.filter(isEoseFrame), [["EOSE", "sub1"]])
+})
 
-  ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
-  await delay(100)
-
-  const eventMessages = messages.filter((m) => m[0] === "EVENT")
-  const eoseMessages = messages.filter((m) => m[0] === "EOSE")
-
-  assertEquals(eventMessages.length, 1)
-  const [eventMessage] = eventMessages
-  if (!eventMessage) throw new Error("expected an EVENT message")
-  assertEquals(eventContent(eventMessage[2]), "note 1")
-  assertEquals(eoseMessages.length, 1)
-  const [eoseMessage] = eoseMessages
-  if (!eoseMessage) throw new Error("expected an EOSE message")
-  assertEquals(eoseMessage[1], "sub1")
-
-  ws.close()
-  await delay(50)
-  await relay.stop()
+Deno.test("in-memory relay - REQ with no stored match is answered with EOSE alone", async () => {
+  const frames = await framesAnsweringReq([], { kinds: [1] })
+  assertEquals(frames, [["EOSE", "sub1"]])
 })
 
 Deno.test("in-memory relay - REQ filters by authors", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-
   const pubkeyA = "a".repeat(64)
-  const pubkeyB = "b".repeat(64)
-  relay.inject(buildEventFixture({ pubkey: pubkeyA, content: "from A" }))
-  relay.inject(buildEventFixture({ pubkey: pubkeyB, content: "from B" }))
-
-  const ws = await connectWs(relay.url)
-  const messages = collectMessages(ws)
-
-  ws.send(JSON.stringify(["REQ", "sub1", { authors: [pubkeyA] }]))
-  await delay(100)
-
-  const eventMessages = messages.filter((m) => m[0] === "EVENT")
-  assertEquals(eventMessages.length, 1)
-  const [eventMessage] = eventMessages
-  if (!eventMessage) throw new Error("expected an EVENT message")
-  assertEquals(eventContent(eventMessage[2]), "from A")
-
-  ws.close()
-  await delay(50)
-  await relay.stop()
+  const frames = await framesAnsweringReq(
+    [
+      buildEventFixture({ pubkey: pubkeyA, content: "from A" }),
+      buildEventFixture({ pubkey: "b".repeat(64), content: "from B" }),
+    ],
+    { authors: [pubkeyA] },
+  )
+  assertEquals(eventContentsOf(frames), ["from A"])
 })
 
 Deno.test("in-memory relay - live subscription receives new events", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-
-  const ws = await connectWs(relay.url)
-  const messages = collectMessages(ws)
-
-  ws.send(JSON.stringify(["REQ", "live", { kinds: [1] }]))
-  await delay(50)
-
-  const eoseCount = messages.filter((m) => m[0] === "EOSE").length
-  assertEquals(eoseCount, 1)
-
-  const liveEvent = buildEventFixture({ kind: 1, content: "live!" })
-  relay.inject(liveEvent)
-  await delay(100)
-
-  const eventMessages = messages.filter((m) => m[0] === "EVENT")
-  assertEquals(eventMessages.length, 1)
-  const [eventMessage] = eventMessages
-  if (!eventMessage) throw new Error("expected an EVENT message")
-  assertEquals(eventContent(eventMessage[2]), "live!")
-
-  ws.close()
-  await delay(50)
-  await relay.stop()
+  const frames = await framesAfterLiveInject(buildEventFixture({ kind: 1, content: "live!" }))
+  assertEquals(eventContentsOf(frames), ["live!"])
 })
 
 Deno.test("in-memory relay - CLOSE unsubscribes", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-
-  const ws = await connectWs(relay.url)
-  const messages = collectMessages(ws)
-
-  ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
-  await delay(50)
-
-  ws.send(JSON.stringify(["CLOSE", "sub1"]))
-  await delay(50)
-
-  relay.inject(buildEventFixture({ kind: 1, content: "after close" }))
-  await delay(100)
-
-  const eventMessages = messages.filter((m) => m[0] === "EVENT")
-  assertEquals(eventMessages.length, 0)
-
-  ws.close()
-  await delay(50)
-  await relay.stop()
+  const frames = await withRelay({}, (relay) =>
+    withClient(relay, async (ws, frames) => {
+      ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
+      await delay(50)
+      ws.send(JSON.stringify(["CLOSE", "sub1"]))
+      await delay(50)
+      relay.inject(buildEventFixture({ kind: 1, content: "after close" }))
+      await delay(100)
+      return [...frames]
+    }))
+  assertEquals(frames.filter(isEventFrame), [])
 })
 
 Deno.test("in-memory relay - tag filter matching", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-
   const targetId = "d".repeat(64)
-  relay.inject(buildEventFixture({ tags: [["e", targetId]], content: "reply" }))
-  relay.inject(buildEventFixture({ content: "unrelated" }))
+  const frames = await framesAnsweringReq(
+    [buildEventFixture({ tags: [["e", targetId]], content: "reply" }), buildEventFixture({ content: "unrelated" })],
+    { "#e": [targetId] },
+  )
+  assertEquals(eventContentsOf(frames), ["reply"])
+})
 
-  const ws = await connectWs(relay.url)
-  const messages = collectMessages(ws)
-
-  ws.send(JSON.stringify(["REQ", "sub1", { "#e": [targetId] }]))
-  await delay(100)
-
-  const eventMessages = messages.filter((m) => m[0] === "EVENT")
-  assertEquals(eventMessages.length, 1)
-  const [eventMessage] = eventMessages
-  if (!eventMessage) throw new Error("expected an EVENT message")
-  assertEquals(eventContent(eventMessage[2]), "reply")
-
-  ws.close()
-  await delay(50)
-  await relay.stop()
+Deno.test("in-memory relay - inject stores each event", async () => {
+  const storedCount = await withRelay({}, (relay) => {
+    relay.inject(buildEventFixture({ content: "one" }))
+    relay.inject(buildEventFixture({ content: "two" }))
+    return relay.getStoredEvents().length
+  })
+  assertEquals(storedCount, 2)
 })
 
 Deno.test("in-memory relay - clear removes all events", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-
-  relay.inject(buildEventFixture({ content: "one" }))
-  relay.inject(buildEventFixture({ content: "two" }))
-  assertEquals(relay.getStoredEvents().length, 2)
-
-  relay.clear()
-  assertEquals(relay.getStoredEvents().length, 0)
-
-  await relay.stop()
+  const storedCount = await withRelay({}, (relay) => {
+    relay.inject(buildEventFixture({ content: "one" }))
+    relay.inject(buildEventFixture({ content: "two" }))
+    relay.clear()
+    return relay.getStoredEvents().length
+  })
+  assertEquals(storedCount, 0)
 })
 
 Deno.test("in-memory relay - cross-client event broadcast", async () => {
-  const relay = createInMemoryRelay()
-  await relay.start()
-
-  const ws1 = await connectWs(relay.url)
-  const ws2 = await connectWs(relay.url)
-  const messages2 = collectMessages(ws2)
-
-  ws2.send(JSON.stringify(["REQ", "live", { kinds: [1] }]))
-  await delay(50)
-
-  const event = buildEventFixture({ kind: 1, content: "from client 1" })
-  ws1.send(JSON.stringify(["EVENT", event]))
-  await delay(100)
-
-  const eventMessages = messages2.filter((m) => m[0] === "EVENT")
-  assertEquals(eventMessages.length, 1)
-  const [eventMessage] = eventMessages
-  if (!eventMessage) throw new Error("expected an EVENT message")
-  assertEquals(eventContent(eventMessage[2]), "from client 1")
-
-  ws1.close()
-  ws2.close()
-  await delay(50)
-  await relay.stop()
+  const frames = await withRelay(
+    {},
+    (relay) =>
+      withClient(relay, (publisher) =>
+        withClient(relay, async (subscriber, frames) => {
+          subscriber.send(JSON.stringify(["REQ", "live", { kinds: [1] }]))
+          await delay(50)
+          publisher.send(JSON.stringify(["EVENT", buildEventFixture({ kind: 1, content: "from client 1" })]))
+          await delay(100)
+          return [...frames]
+        })),
+  )
+  assertEquals(eventContentsOf(frames), ["from client 1"])
 })
 
-Deno.test("in-memory relay - answers an AUTH event with OK and then serves the REQ it refused", async () => {
-  const relay = createInMemoryRelay({ requireAuth: true })
-  await relay.start()
+Deno.test("in-memory relay - refuses a REQ before AUTH with auth-required and a challenge", async () => {
+  const { refusal } = await authExchange(buildEventFixture({ kind: 22242 }))
+  assertEquals(refusal, [["CLOSED", "sub1", "auth-required: authentication required"], ["AUTH", "challenge"]])
+})
 
-  const ws = await connectWs(relay.url)
-  const messages = collectMessages(ws)
-  ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
-  await delay(50)
-  assertEquals(messages[0], ["CLOSED", "sub1", "auth-required: authentication required"])
-  assertEquals(messages[1], ["AUTH", "challenge"])
-
+Deno.test("in-memory relay - answers an AUTH event with OK", async () => {
   const auth = buildEventFixture({ kind: 22242 })
-  ws.send(JSON.stringify(["AUTH", auth]))
-  await delay(50)
-  assertEquals(messages[2], ["OK", auth.id, true, ""])
+  const { authReply } = await authExchange(auth)
+  assertEquals(authReply, [["OK", auth.id, true, ""]])
+})
 
-  ws.send(JSON.stringify(["REQ", "sub1", { kinds: [1] }]))
-  await delay(50)
-  assertEquals(messages[3], ["EOSE", "sub1"])
-
-  ws.close()
-  await delay(50)
-  await relay.stop()
+Deno.test("in-memory relay - serves the REQ it refused once the socket has sent AUTH", async () => {
+  const { served } = await authExchange(buildEventFixture({ kind: 22242 }))
+  assertEquals(served, [["EOSE", "sub1"]])
 })

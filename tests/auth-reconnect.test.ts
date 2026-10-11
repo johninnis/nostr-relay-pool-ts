@@ -6,24 +6,28 @@ import { createInMemoryRelay } from "../testing.ts"
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-// Regression: a subscription parked awaiting NIP-42 AUTH when the socket drops must be re-issued on
-// reconnect. The relay only challenges in response to a REQ, so if the reconnect does not re-send
-// the parked sub it never receives a fresh challenge and strands — no event is ever delivered.
-Deno.test("auth-parked subscription survives a reconnect and resumes after re-auth", async () => {
+interface AuthParkedReconnect {
+  readonly storedId: string
+  readonly authCallsBeforeDrop: number
+  readonly receivedBeforeDrop: ReadonlyArray<string>
+  readonly authCallsAfterReconnect: number
+  readonly receivedAfterReconnect: ReadonlyArray<string>
+}
+
+const reconnectWhileFirstAuthIsHeldOpen = async (): Promise<AuthParkedReconnect> => {
   const relay = createInMemoryRelay({ requireAuth: true })
   await relay.start()
 
   let authCallCount = 0
   let releaseFirstAuth: () => void = () => {}
-  const firstAuthGate = new Promise<void>((resolve) => {
+  const firstAuthHeldOpen = new Promise<void>((resolve) => {
     releaseFirstAuth = resolve
   })
 
   const pool = createRelayPool({
     onAuthChallenge: async (): Promise<NostrEvent> => {
       authCallCount++
-      // Hold the first auth open so the sub is still in the auth-parked state when the socket drops.
-      if (authCallCount === 1) await firstAuthGate
+      if (authCallCount === 1) await firstAuthHeldOpen
       return buildEventFixture({ kind: 22242 })
     },
   })
@@ -32,28 +36,54 @@ Deno.test("auth-parked subscription survives a reconnect and resumes after re-au
     const stored = buildEventFixture({ kind: 1 })
     relay.inject(stored)
 
-    const received: NostrEvent[] = []
+    const received: string[] = []
     pool.subscribe(relay.url, [{ kinds: [1] }], {
       onEvent: (event) => {
-        received.push(event)
+        received.push(event.id)
       },
     })
 
     await delay(200)
-    assertEquals(authCallCount, 1, "the first REQ should have triggered exactly one auth challenge")
-    assertEquals(received.length, 0, "nothing should arrive while the first auth is still gated")
+    const authCallsBeforeDrop = authCallCount
+    const receivedBeforeDrop = [...received]
 
     relay.dropConnections()
     await delay(900)
-
-    assertEquals(authCallCount >= 2, true, "reconnect should re-issue the parked sub and earn a fresh challenge")
-    assertEquals(received.length, 1, "the event should arrive once the reconnected sub re-authenticates")
-    assertEquals(received[0]?.id, stored.id)
+    const authCallsAfterReconnect = authCallCount
+    const receivedAfterReconnect = [...received]
 
     releaseFirstAuth()
     await delay(50)
+
+    return {
+      storedId: stored.id,
+      authCallsBeforeDrop,
+      receivedBeforeDrop,
+      authCallsAfterReconnect,
+      receivedAfterReconnect,
+    }
   } finally {
     pool.dispose()
     await relay.stop()
   }
+}
+
+Deno.test("auth-parked subscription - the first REQ to a relay requiring AUTH earns exactly one challenge", async () => {
+  const { authCallsBeforeDrop } = await reconnectWhileFirstAuthIsHeldOpen()
+  assertEquals(authCallsBeforeDrop, 1)
+})
+
+Deno.test("auth-parked subscription - receives nothing while the first AUTH is held open", async () => {
+  const { receivedBeforeDrop } = await reconnectWhileFirstAuthIsHeldOpen()
+  assertEquals(receivedBeforeDrop, [])
+})
+
+Deno.test("auth-parked subscription - a reconnect re-issues the parked subscription and earns a fresh challenge", async () => {
+  const { authCallsAfterReconnect } = await reconnectWhileFirstAuthIsHeldOpen()
+  assertEquals(authCallsAfterReconnect >= 2, true)
+})
+
+Deno.test("auth-parked subscription - survives a reconnect and receives the stored event after re-auth", async () => {
+  const { storedId, receivedAfterReconnect } = await reconnectWhileFirstAuthIsHeldOpen()
+  assertEquals(receivedAfterReconnect, [storedId])
 })

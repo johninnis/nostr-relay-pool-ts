@@ -30,14 +30,15 @@ export interface PoolSubscription {
 /**
  * Callbacks for a single-relay {@link RelayPool.subscribe}.
  *
- * `onEose` fires once when the relay signals end-of-stored-events; the subscription stays open for
- * live events. `onClosed(reason)` is the terminal signal — it fires once when the subscription is
- * dead and will not be revived: either the relay *terminated* it (a NIP-01 `CLOSED` for any reason
- * other than auth — rate-limiting, shutdown, an unsupported filter) or the pool tore it down
- * (`disconnect`, `dispose`, or a connection gate now rejecting the relay, with `reason` set to
- * `"disconnected"` / `"disposed"` / `"connection gate rejected"` accordingly). Distinct from `onEose`,
- * which means the stored backlog merely ended. A clean socket drop the pool will reconnect is neither
- * — it surfaces via the pool's connection-change and state APIs instead.
+ * `onEose` fires when the relay signals end-of-stored-events; the subscription stays open for live events. It fires
+ * again each time the pool sends the subscription's `REQ` again: after a reconnect, or to widen a read the relay
+ * narrowed until NIP-42 AUTH with NIP-67's `auth` hint, when events already delivered may arrive again.
+ * `onClosed(reason)` is the terminal signal — it fires once when the subscription is dead and will not be revived:
+ * either the relay *terminated* it (a NIP-01 `CLOSED` for any reason other than auth — rate-limiting, shutdown, an
+ * unsupported filter) or the pool tore it down (`disconnect`, `dispose`, or a connection gate now rejecting the relay,
+ * with `reason` set to `"disconnected"` / `"disposed"` / `"connection gate rejected"` accordingly). Distinct from
+ * `onEose`, which means the stored backlog merely ended. A clean socket drop the pool will reconnect is neither — it
+ * surfaces via the pool's connection-change and state APIs instead.
  *
  * Identical filters on the same relay are de-duplicated onto one wire subscription. A caller that
  * subscribes after that wire sub has already EOSE'd receives `onEose` on a microtask but does *not*
@@ -47,7 +48,7 @@ export interface PoolSubscription {
 export interface RelaySubscribeCallbacks {
   /** Fires per event delivered, with the relay that sent it. */
   readonly onEvent: (event: NostrEvent, url: RelayUrl) => void
-  /** Fires once at end-of-stored-events; the subscription stays open for live events. */
+  /** Fires at end-of-stored-events of each `REQ` the pool sends; the subscription stays open for live events. */
   readonly onEose?: (() => void) | undefined
   /** Terminal signal — fires once when the subscription is dead and will not be revived. */
   readonly onClosed?: ((reason: string) => void) | undefined

@@ -1,7 +1,16 @@
 import { assertEquals } from "@std/assert"
 import type { ConnectionPool } from "../src/application/port/connection-pool.ts"
-import type { RelaySubscribeCallbacks, Subscription } from "../src/domain/value-object/subscription.ts"
-import { createSubscribeMany, createSubscribeManyLive } from "../src/application/service/subscribe-many.ts"
+import type {
+  PoolSubscription,
+  RelaySubscribeCallbacks,
+  SubscribeManyCallbacks,
+  Subscription,
+} from "../src/domain/value-object/subscription.ts"
+import {
+  createSubscribeMany,
+  createSubscribeManyLive,
+  type SubscribeManyDeps,
+} from "../src/application/service/subscribe-many.ts"
 import { createManualTime } from "./_helpers/scheduler.ts"
 
 const URL = "wss://relay.example.com"
@@ -28,89 +37,75 @@ const capturingPool = (): CapturingPool => {
   }
 }
 
-Deno.test("subscribeManyLive - a relay CLOSED drops the handle so syncUrls reopens the relay", () => {
-  const time = createManualTime()
-  const capturing = capturingPool()
-  const subscribeManyLive = createSubscribeManyLive({
-    connectionPool: capturing.pool,
-    scheduler: time.scheduler,
-    hardTimeoutMs: 12_000,
-  })
+const fanOutDeps = (capturing: CapturingPool): SubscribeManyDeps => ({
+  connectionPool: capturing.pool,
+  scheduler: createManualTime().scheduler,
+  hardTimeoutMs: 12_000,
+})
 
+const liveFanOut = (
+  capturing: CapturingPool,
+  callbacks: SubscribeManyCallbacks = { onEvent: () => {} },
+): PoolSubscription => createSubscribeManyLive(fanOutDeps(capturing))([URL], [{ kinds: [1] }], callbacks)
+
+const oneShotFanOut = (capturing: CapturingPool): PoolSubscription =>
+  createSubscribeMany(fanOutDeps(capturing))([URL], [{ kinds: [1] }], { onEvent: () => {}, onRelayEose: () => {} })
+
+Deno.test("subscribeManyLive - opens one leg per relay", () => {
+  const capturing = capturingPool()
+  liveFanOut(capturing).unsubscribe()
+  assertEquals(capturing.subscribeCount(), 1)
+})
+
+Deno.test("subscribeManyLive - a relay CLOSED reaches onRelayClosed with its reason", () => {
+  const capturing = capturingPool()
   const closedReasons: string[] = []
-  const handle = subscribeManyLive([URL], [{ kinds: [1] }], {
+  const handle = liveFanOut(capturing, {
     onEvent: () => {},
     onRelayClosed: (_url, reason) => closedReasons.push(reason),
   })
-
-  assertEquals(capturing.subscribeCount(), 1)
-
-  // The relay terminates the subscription (e.g. rate-limited). The leg tears itself down.
   capturing.lastCallbacks()?.onClosed?.("rate-limited: slow down")
-  assertEquals(closedReasons, ["rate-limited: slow down"])
-
-  // Re-listing the same relay must reopen it rather than treat the dead connection as live.
-  handle.syncUrls([URL])
-  assertEquals(capturing.subscribeCount(), 2)
-
   handle.unsubscribe()
+  assertEquals(closedReasons, ["rate-limited: slow down"])
+})
+
+Deno.test("subscribeManyLive - a relay CLOSED drops the handle so syncUrls reopens the relay", () => {
+  const capturing = capturingPool()
+  const handle = liveFanOut(capturing)
+  capturing.lastCallbacks()?.onClosed?.("rate-limited: slow down")
+  handle.syncUrls([URL])
+  handle.unsubscribe()
+  assertEquals(capturing.subscribeCount(), 2)
+})
+
+Deno.test("subscribeMany - opens one leg per relay", () => {
+  const capturing = capturingPool()
+  oneShotFanOut(capturing).unsubscribe()
+  assertEquals(capturing.subscribeCount(), 1)
 })
 
 Deno.test("subscribeMany - a relay EOSE drops the handle so syncUrls reopens the relay", () => {
-  const time = createManualTime()
   const capturing = capturingPool()
-  const subscribeMany = createSubscribeMany({
-    connectionPool: capturing.pool,
-    scheduler: time.scheduler,
-    hardTimeoutMs: 12_000,
-  })
-
-  // Each leg closes at EOSE once the stored backlog drains.
-  const handle = subscribeMany([URL], [{ kinds: [1] }], { onEvent: () => {}, onRelayEose: () => {} })
-  assertEquals(capturing.subscribeCount(), 1)
-
-  // The relay signals end-of-stored-events; the leg completes and tears itself down.
+  const handle = oneShotFanOut(capturing)
   capturing.lastCallbacks()?.onEose?.()
-
-  // Re-listing the same relay must reopen it rather than skip it as still-live.
   handle.syncUrls([URL])
-  assertEquals(capturing.subscribeCount(), 2)
-
   handle.unsubscribe()
+  assertEquals(capturing.subscribeCount(), 2)
 })
 
 Deno.test("subscribeManyLive - syncUrls is a no-op for an unchanged, still-live relay", () => {
-  const time = createManualTime()
   const capturing = capturingPool()
-  const subscribeManyLive = createSubscribeManyLive({
-    connectionPool: capturing.pool,
-    scheduler: time.scheduler,
-    hardTimeoutMs: 12_000,
-  })
-
-  const handle = subscribeManyLive([URL], [{ kinds: [1] }], { onEvent: () => {} })
-  assertEquals(capturing.subscribeCount(), 1)
-
+  const handle = liveFanOut(capturing)
   handle.syncUrls([URL])
-  assertEquals(capturing.subscribeCount(), 1, "a live relay should not be reopened")
-
   handle.unsubscribe()
+  assertEquals(capturing.subscribeCount(), 1, "a live relay should not be reopened")
 })
 
 Deno.test("subscribeManyLive - a relay EOSE keeps the handle so syncUrls does not reopen the relay", () => {
-  const time = createManualTime()
   const capturing = capturingPool()
-  const subscribeManyLive = createSubscribeManyLive({
-    connectionPool: capturing.pool,
-    scheduler: time.scheduler,
-    hardTimeoutMs: 12_000,
-  })
-
-  const handle = subscribeManyLive([URL], [{ kinds: [1] }], { onEvent: () => {} })
+  const handle = liveFanOut(capturing)
   capturing.lastCallbacks()?.onEose?.()
-
   handle.syncUrls([URL])
-  assertEquals(capturing.subscribeCount(), 1, "a live leg stays open past EOSE")
-
   handle.unsubscribe()
+  assertEquals(capturing.subscribeCount(), 1, "a live leg stays open past EOSE")
 })

@@ -11,7 +11,7 @@ import {
   recordSubHistory,
   SUB_HISTORY_LIMIT,
 } from "../src/application/service/relay-history.ts"
-import { tearDownSubs } from "../src/infrastructure/web-socket/relay-state.ts"
+import { type RelayState, tearDownSubs } from "../src/infrastructure/web-socket/relay-state.ts"
 import { stubRelayState, stubWireSub } from "./_helpers/relay-state.ts"
 
 const SUB_1_ID = subscriptionIdFixture("s1")
@@ -29,14 +29,70 @@ const publishEntry = (raw: string): PublishHistoryRecord => ({
   message: "",
 })
 
+const publishHistoryPastLimit = (): ReadonlyArray<PublishHistoryRecord> => {
+  const publishHistory = new Map<RelayUrl, Array<PublishHistoryRecord>>()
+  for (let i = 0; i < PUBLISH_HISTORY_LIMIT + 25; i++) {
+    recordPublishEntry(publishHistory, URL, publishEntry(`e${i}`))
+  }
+  return publishHistory.get(URL) ?? []
+}
+
+const tornDownState = (): RelayState => {
+  const state = stubRelayState()
+  state.subs.set(SUB_1_ID, stubWireSub({ filterHash: "h" }))
+  state.pendingSubs.set(SUB_2_ID, stubWireSub({ filters: [{ kinds: [0] }], filterHash: "h2" }))
+  state.subIdByFilterHash.set("h", SUB_1_ID)
+  const subHistory = new Map<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>()
+  recordSubHistory({ subHistory, url: URL, subId: SUB_1_ID, filters: [{ kinds: [1] }], openedAt: 0 })
+  tearDownSubs({ state, url: URL, subHistory, clock: systemWallClock, scheduler: systemScheduler, reason: "disposed" })
+  return state
+}
+
+interface ListenerSignals {
+  readonly eoseCalls: number
+  readonly closedReasons: ReadonlyArray<string>
+}
+
+const signalsOfTearDown = (): ListenerSignals => {
+  const state = stubRelayState()
+  let eoseCalls = 0
+  const closedReasons: Array<string> = []
+  state.subs.set(
+    SUB_1_ID,
+    stubWireSub({
+      filterHash: "h",
+      listeners: [{
+        onEvent: () => {},
+        onEose: () => {
+          eoseCalls++
+        },
+        onClosed: (reason) => {
+          closedReasons.push(reason)
+        },
+      }],
+    }),
+  )
+  tearDownSubs({
+    state,
+    url: URL,
+    subHistory: new Map(),
+    clock: systemWallClock,
+    scheduler: systemScheduler,
+    reason: "disposed",
+  })
+  return { eoseCalls, closedReasons }
+}
+
 Deno.test("recordSubHistory - records a new open subscription entry", () => {
   const subHistory = new Map<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>()
   recordSubHistory({ subHistory, url: URL, subId: SUB_1, filters: [{ kinds: [1] }], openedAt: 42 })
-  const entry = subHistory.get(URL)?.get(SUB_1)
-  assertEquals(entry?.subId, SUB_1)
-  assertEquals(entry?.openedAt, 42)
-  assertEquals(entry?.closedAt, null)
-  assertEquals(entry?.eventCount, 0)
+  assertEquals(subHistory.get(URL)?.get(SUB_1), {
+    subId: SUB_1,
+    filters: [{ kinds: [1] }],
+    openedAt: 42,
+    closedAt: null,
+    eventCount: 0,
+  })
 })
 
 Deno.test("recordSubHistory - keeps multiple entries for the same relay", () => {
@@ -90,55 +146,29 @@ Deno.test("recordPublishEntry - appends an entry for the relay", () => {
 })
 
 Deno.test("recordPublishEntry - caps the history at the publish limit", () => {
-  const publishHistory = new Map<RelayUrl, Array<PublishHistoryRecord>>()
-  for (let i = 0; i < PUBLISH_HISTORY_LIMIT + 25; i++) {
-    recordPublishEntry(publishHistory, URL, publishEntry(`e${i}`))
-  }
-  const entries = publishHistory.get(URL)
-  assertEquals(entries?.length, PUBLISH_HISTORY_LIMIT)
-  assertEquals(entries?.[0]?.eventId, eventIdFixture("e25".padEnd(64, "0")))
+  assertEquals(publishHistoryPastLimit().length, PUBLISH_HISTORY_LIMIT)
 })
 
-Deno.test("tearDownSubs - clears every subscription map on the state", () => {
-  const state = stubRelayState()
-  state.subs.set(SUB_1_ID, stubWireSub({ filterHash: "h" }))
-  state.pendingSubs.set(SUB_2_ID, stubWireSub({ filters: [{ kinds: [0] }], filterHash: "h2" }))
-  state.subIdByFilterHash.set("h", SUB_1_ID)
-  const subHistory = new Map<RelayUrl, Map<SubscriptionId, SubHistoryRecord>>()
-  recordSubHistory({ subHistory, url: URL, subId: SUB_1_ID, filters: [{ kinds: [1] }], openedAt: 0 })
-  tearDownSubs({ state, url: URL, subHistory, clock: systemWallClock, scheduler: systemScheduler, reason: "disposed" })
-  assertEquals(state.subs.size, 0)
-  assertEquals(state.pendingSubs.size, 0)
-  assertEquals(state.subIdByFilterHash.size, 0)
+Deno.test("recordPublishEntry - drops the oldest entries past the publish limit", () => {
+  assertEquals(publishHistoryPastLimit()[0]?.eventId, eventIdFixture("e25".padEnd(64, "0")))
 })
 
-Deno.test("tearDownSubs - fires the terminal onClosed (not onEose) for active listeners", () => {
-  const state = stubRelayState()
-  let eoseCalls = 0
-  const closedReasons: Array<string> = []
-  state.subs.set(
-    SUB_1_ID,
-    stubWireSub({
-      filterHash: "h",
-      listeners: [{
-        onEvent: () => {},
-        onEose: () => {
-          eoseCalls++
-        },
-        onClosed: (reason) => {
-          closedReasons.push(reason)
-        },
-      }],
-    }),
-  )
-  tearDownSubs({
-    state,
-    url: URL,
-    subHistory: new Map(),
-    clock: systemWallClock,
-    scheduler: systemScheduler,
-    reason: "disposed",
-  })
-  assertEquals(eoseCalls, 0)
-  assertEquals(closedReasons, ["disposed"])
+Deno.test("tearDownSubs - clears the live subscriptions on the state", () => {
+  assertEquals(tornDownState().subs.size, 0)
+})
+
+Deno.test("tearDownSubs - clears the pending subscriptions on the state", () => {
+  assertEquals(tornDownState().pendingSubs.size, 0)
+})
+
+Deno.test("tearDownSubs - clears the filter-hash index on the state", () => {
+  assertEquals(tornDownState().subIdByFilterHash.size, 0)
+})
+
+Deno.test("tearDownSubs - fires no onEose for active listeners", () => {
+  assertEquals(signalsOfTearDown().eoseCalls, 0)
+})
+
+Deno.test("tearDownSubs - fires the terminal onClosed with its reason for active listeners", () => {
+  assertEquals(signalsOfTearDown().closedReasons, ["disposed"])
 })

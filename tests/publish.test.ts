@@ -1,5 +1,6 @@
 import { assertEquals } from "@std/assert"
 import { type NostrEvent, type RelayUrl, serialiseEventMessage } from "@innis/nostr-core"
+import type { PublishResponse } from "../src/domain/value-object/publish-history.ts"
 import { buildEventFixture, relayUrlFixture } from "@innis/nostr-core/testing"
 import type { Scheduler } from "../src/application/port/scheduler.ts"
 import { createPublish } from "../src/infrastructure/web-socket/publish.ts"
@@ -13,9 +14,7 @@ import { createInMemoryRelay } from "../testing.ts"
 
 const URL = relayUrlFixture("wss://relay.example.com")
 
-// The publish path registers its OK resolver before it touches the socket, so these unit tests
-// drive settlement purely through handleRelayMessage — no live socket on `state` is required.
-const openState = (): RelayState => createRelayState()
+const socketlessState = (): RelayState => createRelayState()
 
 const okMessage = (eventId: string, ok: boolean, message: string): MessageEvent =>
   new MessageEvent("message", { data: JSON.stringify(["OK", eventId, ok, message]) })
@@ -46,88 +45,185 @@ const publishWith = (state: RelayState, time: ManualTime, publishTimeoutMs: numb
     releaseIfIdle: (): void => {},
   })
 
-Deno.test("publish - resolves with the relay OK ack", async () => {
-  const state = openState()
+const ACCEPTED: PublishResponse = { from: URL, ok: true, message: "accepted" }
+
+interface PublishInFlight {
+  readonly state: RelayState
+  readonly time: ManualTime
+  readonly pending: Promise<PublishResponse>
+}
+
+const ackedPublish = async (): Promise<{ readonly time: ManualTime; readonly result: PublishResponse }> => {
+  const state = socketlessState()
+  const time = createManualTime()
+  const event = buildEventFixture()
+  const pending = publishWith(state, time, 1_000)(URL, event)
+  handleRelayMessage(messageContext(state, time.scheduler), okMessage(event.id, true, "accepted"))
+  return { time, result: await pending }
+}
+
+interface DuplicatePublish {
+  readonly state: RelayState
+  readonly time: ManualTime
+  readonly outcomes: Promise<ReadonlyArray<PublishResponse>>
+  readonly ack: () => void
+}
+
+const publishedTwiceBeforeAck = (): DuplicatePublish => {
+  const state = socketlessState()
   const time = createManualTime()
   const publish = publishWith(state, time, 1_000)
   const event = buildEventFixture()
-  const pending = publish(URL, event)
-  handleRelayMessage(messageContext(state, time.scheduler), okMessage(event.id, true, "accepted"))
-  const result = await pending
-  assertEquals(result, { from: URL, ok: true, message: "accepted" })
-  assertEquals(time.pendingCount(), 0, "the OK ack should have cleared the publish timeout")
-})
+  const outcomes = Promise.all([publish(URL, event), publish(URL, event)])
+  const ack = (): void =>
+    handleRelayMessage(messageContext(state, time.scheduler), okMessage(event.id, true, "accepted"))
+  return { state, time, outcomes, ack }
+}
 
-Deno.test("publish - a duplicate in-flight publish to the same relay shares one outcome", async () => {
-  const state = openState()
+const refusedForAuthWithNoHandler = (): PublishInFlight => {
+  const state = socketlessState()
   const time = createManualTime()
-  const publish = publishWith(state, time, 1_000)
   const event = buildEventFixture()
-  const first = publish(URL, event)
-  const second = publish(URL, event)
-  // Both calls join a single in-flight record and a single timeout — no second timer to orphan.
-  assertEquals(state.inFlightPublishes.size, 1)
-  assertEquals(time.pendingCount(), 1)
-  handleRelayMessage(messageContext(state, time.scheduler), okMessage(event.id, true, "accepted"))
-  assertEquals(await first, { from: URL, ok: true, message: "accepted" })
-  assertEquals(await second, { from: URL, ok: true, message: "accepted" })
-  assertEquals(time.pendingCount(), 0, "the shared OK ack should have cleared the one publish timeout")
-  assertEquals(state.inFlightPublishes.size, 0)
-})
-
-Deno.test("publish - resolves with the relay's auth-required refusal when no auth handler can answer", async () => {
-  const state = openState()
-  const time = createManualTime()
-  const publish = publishWith(state, time, 200)
-  const event = buildEventFixture()
-  const pending = publish(URL, event)
+  const pending = publishWith(state, time, 200)(URL, event)
   handleRelayMessage(messageContext(state, time.scheduler), okMessage(event.id, false, "auth-required: please AUTH"))
-  assertEquals(await pending, { from: URL, ok: false, message: "auth-required: please AUTH" })
-  assertEquals(time.pendingCount(), 0)
-})
+  return { state, time, pending }
+}
 
-Deno.test("publish - a publish parked for AUTH is settled by the auth timeout, not the publish timeout", async () => {
-  const state = openState()
+const parkedForAuth = (): PublishInFlight & { readonly event: NostrEvent } => {
+  const state = socketlessState()
   const time = createManualTime()
-  const publish = publishWith(state, time, 200)
   const event = buildEventFixture()
-  const pending = publish(URL, event)
+  const pending = publishWith(state, time, 200)(URL, event)
   handleRelayMessage(
     { ...messageContext(state, time.scheduler), authHandler: () => () => new Promise<NostrEvent | null>(() => {}) },
     okMessage(event.id, false, "auth-required: please AUTH"),
   )
-  assertEquals([...state.pendingAuthPublish], [event.id])
-  time.tick(59_999)
-  assertEquals([...state.pendingAuthPublish], [event.id], "the publish timeout must not settle parked work")
-  time.tick(1)
-  assertEquals(await pending, { from: URL, ok: false, message: "auth-required: auth timed out" })
-  assertEquals(state.pendingAuthPublish.size, 0)
-  assertEquals(time.pendingCount(), 0)
-})
+  return { state, time, pending, event }
+}
 
-Deno.test("publish - a publish resent after AUTH is bounded by the publish timeout again", async () => {
+const parkedPastAuthTimeout = (): PublishInFlight => {
+  const parked = parkedForAuth()
+  parked.time.tick(60_000)
+  return parked
+}
+
+interface ResentAfterAuth {
+  readonly sent: ReadonlyArray<string>
+  readonly event: NostrEvent
+  readonly time: ManualTime
+  readonly pending: Promise<PublishResponse>
+}
+
+const resentAfterAuth = async (): Promise<ResentAfterAuth> => {
   const sent: string[] = []
-  const ws = openSocket(sent)
   const state = createRelayState()
-  state.ws = ws
+  state.ws = openSocket(sent)
   const time = createManualTime()
-  const publish = publishWith(state, time, 200)
   const event = buildEventFixture()
   const authEvent = buildEventFixture({ kind: 22242, content: "auth" })
   const ctx = { ...messageContext(state, time.scheduler), authHandler: () => () => Promise.resolve(authEvent) }
-  const pending = publish(URL, event)
+  const pending = publishWith(state, time, 200)(URL, event)
   handleRelayMessage(ctx, new MessageEvent("message", { data: JSON.stringify(["AUTH", "challenge-1"]) }))
   handleRelayMessage(ctx, okMessage(event.id, false, "auth-required: please AUTH"))
   await new Promise((resolve) => setTimeout(resolve, 0))
   handleRelayMessage(ctx, okMessage(authEvent.id, true, ""))
-  assertEquals(sent.at(-1), serialiseEventMessage(event))
-  time.tick(200)
-  assertEquals(await pending, { from: URL, ok: false, message: "timeout" })
-  assertEquals(time.pendingCount(), 0)
+  return { sent, event, time, pending }
+}
+
+const resentPastPublishTimeout = async (): Promise<ResentAfterAuth> => {
+  const resent = await resentAfterAuth()
+  resent.time.tick(200)
+  return resent
+}
+
+Deno.test("publish - resolves with the relay OK ack", async () => {
+  assertEquals((await ackedPublish()).result, ACCEPTED)
+})
+
+Deno.test("publish - the OK ack clears the publish timeout", async () => {
+  assertEquals((await ackedPublish()).time.pendingCount(), 0)
+})
+
+Deno.test("publish - a duplicate in-flight publish to the same relay joins the one in-flight record", () => {
+  assertEquals(publishedTwiceBeforeAck().state.inFlightPublishes.size, 1)
+})
+
+Deno.test("publish - a duplicate in-flight publish to the same relay arms no second timeout", () => {
+  assertEquals(publishedTwiceBeforeAck().time.pendingCount(), 1)
+})
+
+Deno.test("publish - a duplicate in-flight publish to the same relay shares one outcome", async () => {
+  const duplicate = publishedTwiceBeforeAck()
+  duplicate.ack()
+  assertEquals(await duplicate.outcomes, [ACCEPTED, ACCEPTED])
+})
+
+Deno.test("publish - the shared OK ack clears the one publish timeout", () => {
+  const duplicate = publishedTwiceBeforeAck()
+  duplicate.ack()
+  assertEquals(duplicate.time.pendingCount(), 0)
+})
+
+Deno.test("publish - the shared OK ack drops the in-flight record", () => {
+  const duplicate = publishedTwiceBeforeAck()
+  duplicate.ack()
+  assertEquals(duplicate.state.inFlightPublishes.size, 0)
+})
+
+Deno.test("publish - resolves with the relay's auth-required refusal when no auth handler can answer", async () => {
+  assertEquals(await refusedForAuthWithNoHandler().pending, {
+    from: URL,
+    ok: false,
+    message: "auth-required: please AUTH",
+  })
+})
+
+Deno.test("publish - an auth-required refusal with no auth handler leaves no timeout pending", () => {
+  assertEquals(refusedForAuthWithNoHandler().time.pendingCount(), 0)
+})
+
+Deno.test("publish - an auth-required refusal parks the publish while an auth handler can answer", () => {
+  const parked = parkedForAuth()
+  assertEquals(parked.state.pendingAuthPublish, new Set([parked.event.id]))
+})
+
+Deno.test("publish - the publish timeout does not settle a publish parked for AUTH", () => {
+  const parked = parkedForAuth()
+  parked.time.tick(59_999)
+  assertEquals(parked.state.pendingAuthPublish, new Set([parked.event.id]))
+})
+
+Deno.test("publish - a publish parked for AUTH is settled by the auth timeout, not the publish timeout", async () => {
+  assertEquals(await parkedPastAuthTimeout().pending, {
+    from: URL,
+    ok: false,
+    message: "auth-required: auth timed out",
+  })
+})
+
+Deno.test("publish - the auth timeout clears the parked publish", () => {
+  assertEquals(parkedPastAuthTimeout().state.pendingAuthPublish.size, 0)
+})
+
+Deno.test("publish - the auth timeout leaves no timer pending", () => {
+  assertEquals(parkedPastAuthTimeout().time.pendingCount(), 0)
+})
+
+Deno.test("publish - a publish parked for AUTH is resent once the relay accepts the AUTH", async () => {
+  const resent = await resentAfterAuth()
+  assertEquals(resent.sent.at(-1), serialiseEventMessage(resent.event))
+})
+
+Deno.test("publish - a publish resent after AUTH is bounded by the publish timeout again", async () => {
+  assertEquals(await (await resentPastPublishTimeout()).pending, { from: URL, ok: false, message: "timeout" })
+})
+
+Deno.test("publish - the publish timeout of a resent publish leaves no timer pending", async () => {
+  assertEquals((await resentPastPublishTimeout()).time.pendingCount(), 0)
 })
 
 Deno.test("publish - a relay's refusal resolves as a non-accepting outcome carrying its message", async () => {
-  const state = openState()
+  const state = socketlessState()
   const time = createManualTime()
   const publish = publishWith(state, time, 1_000)
   const event = buildEventFixture()
@@ -170,8 +266,11 @@ Deno.test("publish resolves, never rejects, for a relay the connection gate refu
   const pool = createRelayPool()
   try {
     pool.setConnectionGate(() => false)
-    const result = await pool.publish(relay.url, buildEventFixture())
-    assertEquals([result.ok, result.message], [false, "failed to connect"])
+    assertEquals(await pool.publish(relay.url, buildEventFixture()), {
+      from: relay.url,
+      ok: false,
+      message: "failed to connect",
+    })
   } finally {
     pool.dispose()
     await relay.stop()

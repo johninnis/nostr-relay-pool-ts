@@ -14,13 +14,15 @@ Auth handlers often have a person in the loop (a browser extension prompt, a rem
 
 ## Decision
 
-- The pool stores the relay's latest challenge on the connection and answers it on arrival when a handler is set, the relay has not accepted an `AUTH`, and no answer is in flight. A repeated challenge frame is answered again.
-- When an `auth-required` refusal parks work (ADR-0001), or the relay answers the pool's `AUTH` with `auth-required:`, the stored challenge is answered if it has not been answered yet.
-- One answer is in flight per connection. It spans the handler producing the event and the relay's `OK` for it, and is abandoned when the auth timer fires (`authTimeoutMs`, default 60000, restarted with each answer and kept running while work is parked), which settles parked work as `auth-required: auth timed out` (ADR-0001) and lets the next challenge be answered. A timeout is an anticipated outcome, not a fault, so it is not reported as an error. A handler that returns `null` ends the attempt without sending anything and declines the challenge (ADR-0001); the next challenge frame clears the decline.
+- Every challenge frame is a new challenge, even when its string repeats one already answered or one whose answer is in flight. The pool stores the latest on the connection as not yet answered, and answers it on arrival when a handler is set, the relay has not accepted an `AUTH`, and no answer is in flight.
+- When an `auth-required` refusal parks work (ADR-0001), or the relay answers the pool's `AUTH` with `auth-required:`, the stored challenge is answered if it has not been answered yet. A frame that arrived while an answer was in flight has not been, whatever its string.
+- One answer is in flight per connection. It spans the handler producing the event and the relay's `OK` for it, and is abandoned when the auth timer fires (`authTimeoutMs`, default 60000, restarted with each answer and kept running while work is parked), which settles parked work as `auth-required: auth timed out` (ADR-0001) and lets the next challenge be answered. A timeout is an anticipated outcome, not a fault, so it is not reported as an error. A handler that returns `null` ends the attempt without sending anything and declines the challenge it was given (ADR-0001); the next challenge frame clears the decline, and a frame that arrived while the handler was deciding is not declined.
 - A new connection starts with no challenge and not authenticated.
 
 ## Consequences
 
 - The NIP's stored-challenge flow works whether the handler was set before or after the challenge arrived.
+- A relay that sends its challenge string again while the pool's answer is in flight, then answers that `AUTH` with `auth-required:`, has the repeat answered at once; the pool does not read it as already answered and wait out `authTimeoutMs`. innis/nostr-client reads every frame the same way (shared ADR-0030).
 - A declined challenge is not offered to the handler again until the relay sends a new one, so a person who said no is not asked repeatedly.
 - A hung handler or a relay that never answers `AUTH` blocks further answers on that connection only until `authTimeoutMs`, and the work waiting on it is settled then.
+- Shared decision: nostr-adrs ADR-0030.

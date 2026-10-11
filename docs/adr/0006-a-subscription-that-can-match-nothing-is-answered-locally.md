@@ -20,3 +20,4 @@ The pool still owes the caller an answer. Opening a socket to send nothing waste
 - A caller need not guard its own empty lists before subscribing: the answer is an empty backlog, the same a relay would give if it read the filter as NIP-01 intends.
 - A subscription whose filters partly match nothing sends only the filters that can match; the local predicate already matches nothing for the others.
 - Do not open a connection for such a subscription, or mark it inactive: nothing failed, and there is nothing to ask a relay.
+- Shared decision: nostr-adrs ADR-0069.

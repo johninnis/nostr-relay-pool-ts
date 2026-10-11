@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert"
 import { relayUrlFixture } from "@innis/nostr-core/testing"
-import { createLatencyTracker } from "../src/application/service/latency-tracker.ts"
+import { createLatencyTracker, type LatencyTracker } from "../src/application/service/latency-tracker.ts"
 
 const url = relayUrlFixture("wss://relay.example.com")
 
@@ -50,7 +50,6 @@ Deno.test("ring buffer evicts oldest samples past sampleSize", () => {
   })
   for (let i = 0; i < 5; i++) t.record(url, 10000)
   for (let i = 0; i < 5; i++) t.record(url, 2000)
-  // With a 5-deep ring buffer the slow samples are fully evicted, so the p95 reflects only the 2000s.
   assertEquals(t.suggestedTimeout(url), 2000)
 })
 
@@ -63,9 +62,8 @@ Deno.test("p95 interpolates between ranks rather than collapsing to the maximum"
     minSamples: 3,
   })
   for (let i = 1; i <= 20; i++) t.record(url, i * 100)
-  // R-7 p95 over [100..2000] is rank (20-1)*0.95 = 18.05 -> 1900 + 0.05*(2000-1900) = 1905.
-  // A nearest-rank index would have returned the maximum, 2000.
-  assertEquals(t.suggestedTimeout(url), 1905)
+  const p95InterpolatedBetween1900And2000 = 1900 + (2000 - 1900) * 0.05
+  assertEquals(t.suggestedTimeout(url), p95InterpolatedBetween1900And2000)
 })
 
 Deno.test("ignores non-finite and negative samples", () => {
@@ -73,11 +71,13 @@ Deno.test("ignores non-finite and negative samples", () => {
   t.record(url, NaN)
   t.record(url, Infinity)
   t.record(url, -100)
-  // None were recorded, so the relay stays below minSamples and falls back to defaultTimeoutMs.
-  assertEquals(t.suggestedTimeout(url), 4000)
+  assertEquals(t.suggestedTimeout(url), t.defaultTimeoutMs)
 })
 
-Deno.test("tracks samples per relay independently", () => {
+const fast = relayUrlFixture("wss://fast.example.com")
+const slow = relayUrlFixture("wss://slow.example.com")
+
+const trackerOfFastAndSlowRelays = (): LatencyTracker => {
   const t = createLatencyTracker({
     defaultTimeoutMs: 1000,
     maxTimeoutMs: 20000,
@@ -85,12 +85,17 @@ Deno.test("tracks samples per relay independently", () => {
     sampleSize: 20,
     minSamples: 3,
   })
-  const fast = relayUrlFixture("wss://fast.example.com")
-  const slow = relayUrlFixture("wss://slow.example.com")
   for (let i = 0; i < 5; i++) {
     t.record(fast, 100)
     t.record(slow, 6000)
   }
-  assertEquals(t.suggestedTimeout(fast), 1000)
-  assertEquals(t.suggestedTimeout(slow), 9000)
+  return t
+}
+
+Deno.test("tracks samples per relay independently: a fast relay keeps the floor beside a slow one", () => {
+  assertEquals(trackerOfFastAndSlowRelays().suggestedTimeout(fast), 1000)
+})
+
+Deno.test("tracks samples per relay independently: a slow relay keeps its own p95 beside a fast one", () => {
+  assertEquals(trackerOfFastAndSlowRelays().suggestedTimeout(slow), 9000)
 })

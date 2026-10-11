@@ -37,12 +37,9 @@ export const createPublish = (deps: PublishDeps) => {
         return
       }
 
-      // Identical event already in flight to this relay: join its single outcome rather than open a
-      // second timer/resolver under the same event-id key, which would clobber the first's timer
-      // handle and could strand either promise. Same dedup the wire-sub layer applies to filters.
-      const existing = state.inFlightPublishes.get(event.id)
-      if (existing) {
-        existing.resolvers.add(resolve)
+      const sameEventInFlight = state.inFlightPublishes.get(event.id)
+      if (sameEventInFlight) {
+        sameEventInFlight.resolvers.add(resolve)
         return
       }
 
@@ -54,7 +51,6 @@ export const createPublish = (deps: PublishDeps) => {
         message: "",
       }
       recordPublishEntry(publishHistory, url, record)
-      // A new publish (not a dedup join): bump the lifetime tally, which also invalidates the cache.
       onPublishInitiated(url)
 
       let timeoutId: TimerHandle | null = null
@@ -63,24 +59,17 @@ export const createPublish = (deps: PublishDeps) => {
         timeoutId = null
       }
 
-      // Single settlement path for every outcome (ack, timeout, disconnect, dispose): clear the timer,
-      // drop the in-flight record, leave the AUTH resend queue, stamp the history record, and resolve
-      // every awaiting caller exactly once.
       const settle = (outcome: PublishOutcome, ack: PublishAck): void => {
         const inFlight = state.inFlightPublishes.get(event.id)
         if (!inFlight) return
         suspendTimeout()
         state.inFlightPublishes.delete(event.id)
-        // An event parked for AUTH that settles (e.g. its connection drops) must leave the resend
-        // queue too, or a later successful AUTH re-sends an already-resolved publish.
         state.pendingAuthPublish.delete(event.id)
         record.result = outcome
         record.message = ack.message
         invalidateCache()
         const response: PublishResponse = { from: url, ...ack }
         for (const resolver of inFlight.resolvers) resolver(response)
-        // A publish-only socket has no unsubscribe to drain it, so the last settle is its release
-        // point — without this a socket opened just to publish would stay open forever.
         releaseIfIdle(url, state)
       }
 
@@ -98,22 +87,15 @@ export const createPublish = (deps: PublishDeps) => {
         restartTimeout,
       })
 
+      const sendIfStillInFlight = (): void => {
+        if (state.inFlightPublishes.has(event.id) && state.ws) {
+          sendOnWebSocket(state.ws, serialiseEventMessage(event))
+        }
+      }
+
       const ws = state.ws
       if (ws === null) return
-      if (isOpen(ws)) {
-        sendOnWebSocket(ws, serialiseEventMessage(event))
-      } else {
-        // Socket is still connecting: defer the send until it opens. This is deliberately a private
-        // one-shot listener rather than riding the socket-manager's onopen reissue path (which
-        // re-sends every pending sub on every reconnect): a publish must fire on *this* open only and
-        // is never re-sent on a later reconnect, so it cannot live in the reissue set. Re-check the
-        // in-flight record on fire — if the publish already settled (timeout) or the socket dropped
-        // (disconnect deletes the record), there is nothing left to send. `{ once: true }` clears it.
-        ws.addEventListener("open", () => {
-          if (state.inFlightPublishes.has(event.id) && state.ws) {
-            sendOnWebSocket(state.ws, serialiseEventMessage(event))
-          }
-        }, { once: true })
-      }
+      if (isOpen(ws)) sendOnWebSocket(ws, serialiseEventMessage(event))
+      else ws.addEventListener("open", sendIfStillInFlight, { once: true })
     })
 }

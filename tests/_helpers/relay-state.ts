@@ -11,8 +11,6 @@ export const stubRelayState = (overrides: Partial<RelayState> = {}): RelayState 
   ...overrides,
 })
 
-// Build an in-flight publish record with no timer, so a test that never settles it leaks no pending
-// op. Callers override `settle` to observe dispatch.
 export const stubInFlightPublish = (event: NostrEvent, overrides: Partial<InFlightPublish> = {}): InFlightPublish => ({
   event,
   resolvers: new Set(),
@@ -27,10 +25,11 @@ export const stubWireSub = (overrides: Partial<WireSub> = {}): WireSub => {
   return {
     filters,
     filterHash: "hash",
-    compiled: compileFilters(filters),
+    compiledWithoutSearch: compileFilters(filters),
     listeners: [],
     eoseFired: false,
-    reqSentAt: 0,
+    lastReqSentAt: 0,
+    widening: "none",
     ...overrides,
   }
 }

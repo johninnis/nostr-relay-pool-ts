@@ -34,10 +34,6 @@ interface SubscriptionCounts {
   readonly closed: number
 }
 
-// The single source of truth for "what subscriptions does this relay have, and in what state".
-// Active subs come from the live map, pending from the not-yet-open and auth-parked maps, and any
-// history entry not represented in those maps is a past sub (closed) or an orphaned pending one.
-// Both the counts and the detailed listing derive from this one walk.
 const classifySubscriptions = (
   state: RelayState | undefined,
   history: ReadonlyMap<SubscriptionId, SubHistoryRecord> | undefined,
@@ -105,8 +101,6 @@ const resolveStatus = (
   snapshot: PoolSnapshot,
 ): RelayStatus => {
   if (!isSocketOpen(state)) {
-    // A pending reconnect means the relay dropped while it still had subscriptions and the pool
-    // is scheduled to revive it — more informative than the "disabled" backoff window it sits in.
     if (snapshot.reconnectingUrls.has(url)) return "reconnecting"
     if (snapshot.backoff.isDisabled(url)) return "disabled"
   }
@@ -142,9 +136,6 @@ export const buildPoolState = (snapshot: PoolSnapshot): ReadonlyArray<RelayPoolS
   for (const url of snapshot.backoff.getDisabledUrls()) {
     if (!entries.has(url)) entries.set(url, buildEntry(url, undefined, snapshot))
   }
-  // Stable, intent-free order: connections first (insertion order), then attempt-only relays, then
-  // backoff-disabled ones. The pool ranks nothing — every entry carries an `eventCount`, and any
-  // ordering policy (by latency, by event volume, by allow-list) belongs to the selection layer.
   return [...entries.values()]
 }
 
@@ -156,18 +147,15 @@ export const buildRelaySubscriptions = (
 ): ReadonlyArray<RelaySubscriptionEntry> =>
   classifySubscriptions(snapshot.connections.get(url), snapshot.subHistory.get(url))
 
-// Snapshot each record by value, newest first. The internal record is mutated in place when its
-// publish later settles, so returning the live object would leak that mutation to the caller.
+const copyOfRecord = (record: PublishHistoryRecord): PublishHistoryEntry => ({
+  eventId: record.eventId,
+  kind: record.kind,
+  publishedAt: record.publishedAt,
+  result: record.result,
+  message: record.message,
+})
+
 export const buildRelayPublishHistory = (
   url: RelayUrl,
   snapshot: Pick<PoolSnapshot, "publishHistory">,
-): ReadonlyArray<PublishHistoryEntry> =>
-  (snapshot.publishHistory.get(url) ?? [])
-    .map((record): PublishHistoryEntry => ({
-      eventId: record.eventId,
-      kind: record.kind,
-      publishedAt: record.publishedAt,
-      result: record.result,
-      message: record.message,
-    }))
-    .reverse()
+): ReadonlyArray<PublishHistoryEntry> => (snapshot.publishHistory.get(url) ?? []).map(copyOfRecord).reverse()

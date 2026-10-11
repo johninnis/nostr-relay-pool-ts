@@ -4,19 +4,11 @@ import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler, TimerHandle } from "../../application/port/scheduler.ts"
 import { closeSubHistory, type SubHistoryMap } from "../../application/service/relay-history.ts"
 import type { PublishResponse } from "../../domain/value-object/publish-history.ts"
-import type { WireSub } from "./wire-sub.ts"
-import { closeWebSocket, sendOnWebSocket } from "./web-socket-helpers.ts"
+import type { Widening, WireSub } from "./wire-sub.ts"
+import { sendOnWebSocket } from "./web-socket-helpers.ts"
 
-/** Internal publish-resolver shape — the per-relay `OK` reply, without the `from` URL the pool adds. */
 export type PublishAck = Omit<PublishResponse, "from">
 
-/**
- * One publish awaiting its relay `OK` (or timeout). Keyed by event id in `RelayState.inFlightPublishes`,
- * so the event, its awaiting resolvers, its timeout timer, and the ack-settlement closure live as one
- * record rather than three maps mutated in lockstep. `resolvers` is a set because concurrent
- * `publish` calls for the identical event to one relay deduplicate onto a single in-flight send —
- * the same listener-set dedup the wire-sub layer uses — and all share its single outcome.
- */
 export interface InFlightPublish {
   readonly event: NostrEvent
   readonly resolvers: Set<(response: PublishResponse) => void>
@@ -33,8 +25,7 @@ export interface RelayState {
   subIdByFilterHash: Map<string, SubscriptionId>
   intentionalClose: boolean
   authed: boolean
-  challenge: AuthChallenge | null
-  answeredChallenge: AuthChallenge | null
+  unansweredChallenge: AuthChallenge | null
   authDeclined: boolean
   authAttempt: symbol | null
   authTimer: TimerHandle | null
@@ -56,8 +47,7 @@ export const createRelayState = (): RelayState => ({
   subIdByFilterHash: new Map(),
   intentionalClose: false,
   authed: false,
-  challenge: null,
-  answeredChallenge: null,
+  unansweredChallenge: null,
   authDeclined: false,
   authAttempt: null,
   authTimer: null,
@@ -88,25 +78,25 @@ export interface ReissueReqInput {
   readonly clock: WallClock
 }
 
-/**
- * Put a wire subscription's REQ on the socket and reset its round-trip clock: clear `eoseFired`
- * and re-stamp `reqSentAt` so EOSE latency is measured against this fresh request, not the
- * original subscribe. The single way the pool issues a REQ — initial send, reconnect reopen, and
- * post-AUTH flush all route through here so there is exactly one definition of "send this sub".
- */
-export const reissueReq = ({ ws, subId, sub, clock }: ReissueReqInput): void => {
+const sendReq = ({ ws, subId, sub, clock }: ReissueReqInput, widening: Widening): void => {
   sub.eoseFired = false
-  sub.reqSentAt = clock()
+  sub.lastReqSentAt = clock()
+  sub.widening = widening
   const req = serialiseReqMessage(subId, sub.filters)
   if (req !== null) sendOnWebSocket(ws, req)
 }
 
-/**
- * Promote every auth-parked sub onto the live socket: re-issue its REQ and move it into `subs`.
- * Shared by the reconnect path (socket reopen) and the flush on the relay's `OK true` for our AUTH
- * event so the parked-sub promotion lives in exactly one place.
- */
-export const promoteAuthedSubs = (state: RelayState, clock: WallClock): void => {
+export const reissueReq = (input: ReissueReqInput): void => sendReq(input, "none")
+
+export const widenNarrowedSubs = (state: RelayState, clock: WallClock): void => {
+  const ws = state.ws
+  if (!ws) return
+  for (const [subId, sub] of state.subs) {
+    if (sub.widening === "awaiting-auth") sendReq({ ws, subId, sub, clock }, "sent")
+  }
+}
+
+export const reissueAuthParkedSubs = (state: RelayState, clock: WallClock): void => {
   const ws = state.ws
   if (!ws) return
   for (const [subId, sub] of state.pendingAuthSubs) {
@@ -116,24 +106,19 @@ export const promoteAuthedSubs = (state: RelayState, clock: WallClock): void => 
   state.pendingAuthSubs.clear()
 }
 
+export const settleInFlightPublishes = (state: RelayState, message: string): void => {
+  for (const inFlight of [...state.inFlightPublishes.values()]) inFlight.settle({ ok: false, message })
+}
+
 export const hasAnySubs = (state: RelayState): boolean =>
   state.subs.size > 0 || state.pendingAuthSubs.size > 0 || state.pendingSubs.size > 0
 
-/**
- * True when the relay has no remaining activity of any kind — no subscription (live, pending, or
- * auth-parked) and no publish awaiting its ack. The single definition of "this socket serves no
- * caller", consulted both when scheduling an idle close and again when its timer fires.
- */
 export const isIdle = (state: RelayState): boolean =>
   !hasAnySubs(state) && state.inFlightPublishes.size === 0 && state.pendingAuthPublish.size === 0
 
-/**
- * Close a socket the pool itself is taking down. Flagging the close as intentional stops the
- * relay's onclose handler from treating it as a failure (which would trigger backoff/reconnect).
- */
 export const closeIntentionally = (state: RelayState): void => {
   state.intentionalClose = true
-  if (state.ws) closeWebSocket(state.ws)
+  state.ws?.close()
 }
 
 export interface TearDownSubsInput {
@@ -145,12 +130,6 @@ export interface TearDownSubsInput {
   readonly reason: string
 }
 
-/**
- * Close out every subscription on `state` — fires the terminal `onClosed(reason)` for active
- * listeners (a pool-initiated teardown ends the stream; it is *not* an EOSE, which means "stored
- * events done, stream continues"), stamps closedAt on history entries, and clears every pending-sub
- * timer. Mutates `state` in place; the caller still owns whether to close the underlying socket.
- */
 export const tearDownSubs = ({ state, url, subHistory, clock, scheduler, reason }: TearDownSubsInput): void => {
   for (const [subId, wireSub] of state.subs) {
     for (const listener of wireSub.listeners) listener.onClosed?.(reason)
@@ -170,14 +149,12 @@ export const releaseAuthAttempt = (state: RelayState): void => {
   state.authEventId = null
 }
 
-/** Cancel the watchdog of the pending sub `subId`, if it has one. */
 export const cancelPendingSubTimeout = (state: RelayState, scheduler: Scheduler, subId: SubscriptionId): void => {
   const timer = state.pendingSubTimeouts.get(subId)
   if (timer !== undefined) scheduler.clearTimer(timer)
   state.pendingSubTimeouts.delete(subId)
 }
 
-/** Cancel the watchdog of every pending sub. */
 export const cancelPendingSubTimeouts = (state: RelayState, scheduler: Scheduler): void => {
   for (const timer of state.pendingSubTimeouts.values()) scheduler.clearTimer(timer)
   state.pendingSubTimeouts.clear()
@@ -188,7 +165,19 @@ export const cancelAuthTimer = (state: RelayState, scheduler: Scheduler): void =
   state.authTimer = null
 }
 
-/** Drop the connection's AUTH answer in flight and its auth timer, for a connection that is going away. */
+export const cancelIdleClose = (state: RelayState, scheduler: Scheduler): void => {
+  if (state.idleTimer !== null) scheduler.clearTimer(state.idleTimer)
+  state.idleTimer = null
+}
+
+export const stopConnectionTimers = (state: RelayState, scheduler: Scheduler): void => {
+  if (state.stabilityTimer !== null) scheduler.clearTimer(state.stabilityTimer)
+  state.stabilityTimer = null
+  cancelIdleClose(state, scheduler)
+  if (state.heartbeatTimer !== null) scheduler.clearTimer(state.heartbeatTimer)
+  state.heartbeatTimer = null
+}
+
 export const abandonAuth = (state: RelayState, scheduler: Scheduler): void => {
   releaseAuthAttempt(state)
   cancelAuthTimer(state, scheduler)

@@ -62,8 +62,6 @@ export const createRelayConnection = (input: CreateRelayConnectionInput): RelayC
 
   const onClosed = (reason: string): void => {
     callbacks.onRelayClosed?.(url, reason)
-    // A relay-terminated subscription is dead and will not be revived — settle and tear down even
-    // in persistent mode, where an EOSE alone would keep the stream notionally open.
     fireComplete()
     finish(true)
   }

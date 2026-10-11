@@ -1,6 +1,7 @@
 import type { AuthHandler } from "./auth-handler.ts"
 import type { BackoffPersistence } from "./backoff-persistence.ts"
 import type { WallClock } from "./clock.ts"
+import type { RelayInformationLookup } from "./relay-information-lookup.ts"
 import type { Scheduler } from "./scheduler.ts"
 import type { BackoffRecord } from "../../domain/value-object/backoff-record.ts"
 import type { LatencyTrackerOverrides } from "../../domain/value-object/latency-config.ts"
@@ -48,4 +49,10 @@ export interface RelayPoolConfig {
    * relay message is, and the connection stays open. Default: 262144 (256 KiB).
    */
   readonly maxMessageBytes?: number
+  /**
+   * The NIP-11 relay information document the host holds for a relay, or `null` when it holds none. A filter with a
+   * NIP-50 `search` is sent only to a relay whose document lists 50 in `supportedNips`; a relay whose document is
+   * unknown is not sent one. Default: none, so no relay is sent a search.
+   */
+  readonly relayInformation?: RelayInformationLookup
 }

@@ -34,3 +34,4 @@ There is one path for auth-parked work on a connection, shared by publishes and 
 - Subscriptions are parked and re-issued, following the NIP-42 flow in which the client sends the `REQ` again after the relay's `OK`, because consumers hold long-lived subscriptions to relays that require authentication for reads.
 - The synthetic rejection reason starts with `auth-required:` so it parses under the shared `OK`/`CLOSED` reason vocabulary.
 - `RelayPoolStateEntry.authed` means the relay answered the pool's `AUTH` with `OK true`, not that an `AUTH` was sent.
+- Shared decision: nostr-adrs ADR-0030.

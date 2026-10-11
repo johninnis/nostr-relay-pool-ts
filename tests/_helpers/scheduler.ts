@@ -6,17 +6,21 @@ interface PendingTimer {
   readonly callback: () => void
 }
 
-/**
- * Deterministic time control for tests: a paired {@link WallClock} and {@link Scheduler} sharing
- * one virtual clock. Nothing fires until `tick(ms)` advances time, so timer-driven behaviour
- * (reconnect, backoff, soft/hard timeouts) runs instantly and without flake.
- */
 export interface ManualTime {
   readonly clock: WallClock
   readonly scheduler: Scheduler
   readonly tick: (ms: number) => void
   readonly pendingCount: () => number
 }
+
+const opaqueTimerHandle = (): TimerHandle => {
+  const handle = setTimeout(() => {}, 0)
+  clearTimeout(handle)
+  return handle
+}
+
+const firesBefore = (timer: PendingTimer, other: PendingTimer): boolean =>
+  timer.fireAt < other.fireAt || (timer.fireAt === other.fireAt && timer.seq < other.seq)
 
 export const createManualTime = (startMs = 0): ManualTime => {
   let current = startMs
@@ -25,10 +29,7 @@ export const createManualTime = (startMs = 0): ManualTime => {
 
   const scheduler: Scheduler = {
     setTimer: (callback: () => void, delayMs: number): TimerHandle => {
-      // Mint a real, immediately-cleared handle so it is the platform's opaque timer type rather
-      // than a fabricated number. The virtual clock — not the runtime — decides when it fires.
-      const handle = setTimeout(() => {}, 0)
-      clearTimeout(handle)
+      const handle = opaqueTimerHandle()
       timers.set(handle, { seq: ++nextSeq, fireAt: current + Math.max(0, delayMs), callback })
       return handle
     },
@@ -37,24 +38,22 @@ export const createManualTime = (startMs = 0): ManualTime => {
     },
   }
 
+  const nextTimerDueBy = (target: number): [TimerHandle, PendingTimer] | undefined => {
+    let next: [TimerHandle, PendingTimer] | undefined
+    for (const [handle, timer] of timers) {
+      if (timer.fireAt > target) continue
+      if (next === undefined || firesBefore(timer, next[1])) next = [handle, timer]
+    }
+    return next
+  }
+
   const tick = (ms: number): void => {
     const target = current + ms
-    // Re-scan after every fire: a callback may schedule a new timer that is itself due before
-    // `target`, or clear one that was — both must be honoured mid-drain.
-    for (;;) {
-      let nextHandle: TimerHandle | undefined
-      let next: PendingTimer | undefined
-      for (const [handle, timer] of timers) {
-        if (timer.fireAt > target) continue
-        if (!next || timer.fireAt < next.fireAt || (timer.fireAt === next.fireAt && timer.seq < next.seq)) {
-          next = timer
-          nextHandle = handle
-        }
-      }
-      if (!next || nextHandle === undefined) break
-      timers.delete(nextHandle)
-      current = next.fireAt
-      next.callback()
+    for (let due = nextTimerDueBy(target); due !== undefined; due = nextTimerDueBy(target)) {
+      const [handle, timer] = due
+      timers.delete(handle)
+      current = timer.fireAt
+      timer.callback()
     }
     current = target
   }

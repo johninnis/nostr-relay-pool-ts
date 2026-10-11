@@ -19,7 +19,9 @@ export interface RelayPool {
   /**
    * Open a single-relay subscription; returns a {@link Subscription} handle. A filter that can match nothing is not
    * sent, and a subscription none of whose filters can match anything opens no connection: it ends its stored events
-   * on a microtask and never delivers an event.
+   * on a microtask and never delivers an event. A filter with a NIP-50 `search` is sent only to a relay whose NIP-11
+   * document, from the pool's `relayInformation` option, lists 50; a subscription left with nothing to send is answered
+   * the same way.
    */
   readonly subscribe: (
     rawUrl: string,

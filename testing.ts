@@ -10,17 +10,6 @@
 import type { CompiledFilter, NostrEvent, NostrFilter, RelayUrl } from "@innis/nostr-core"
 import { compileFilters, isOk, isRecord, parseJson, parseNostrEvent, parseRelayUrl } from "@innis/nostr-core"
 
-// Self-contained close so this reference relay reaches into no package internals. close() throws on
-// some platforms once the socket is already torn down; nothing is recoverable, so swallow it.
-const closeSocket = (ws: WebSocket): void => {
-  if (ws.readyState === WebSocket.CLOSED) return
-  try {
-    ws.close()
-  } catch {
-    // already closed — nothing to clean up
-  }
-}
-
 interface StoredEvent {
   readonly event: NostrEvent
   readonly receivedAt: number
@@ -74,8 +63,6 @@ export interface InMemoryRelayOptions {
 export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemoryRelay => {
   const { port = 0, eoseDelayMs = 0, requireAuth = false } = options
   const events: Map<string, StoredEvent> = new Map()
-  // Keyed by socket, then by subscription id: a relay holds at most one live sub per (socket, subId),
-  // so a repeat REQ replaces rather than accumulates a duplicate that would double-broadcast.
   const subscriptions: Map<WebSocket, Map<string, ClientSubscription>> = new Map()
   let server: Deno.HttpServer | null = null
   let actualPort = port
@@ -88,11 +75,9 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
     }
   }
 
-  // Fan one event out to every matching subscription, optionally skipping the socket that supplied
-  // it. `send` already gates on the socket being open. Shared by client EVENTs and test injection.
-  const broadcast = (event: NostrEvent, exclude?: WebSocket): void => {
+  const broadcast = (event: NostrEvent, sender?: WebSocket): void => {
     for (const [ws, subs] of subscriptions) {
-      if (ws === exclude) continue
+      if (ws === sender) continue
       for (const sub of subs.values()) {
         if (sub.filter.matches(event)) send(ws, ["EVENT", sub.subId, event])
       }
@@ -101,8 +86,6 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
 
   const handleReq = (ws: WebSocket, subId: string, filters: ReadonlyArray<NostrFilter>): void => {
     if (requireAuth && !authedSockets.has(ws)) {
-      // Challenge only in response to a REQ (not proactively on connect): a reconnect that fails to
-      // re-issue an auth-parked sub then receives no fresh challenge, so the sub strands.
       send(ws, ["CLOSED", subId, "auth-required: authentication required"])
       send(ws, ["AUTH", "challenge"])
       return
@@ -150,8 +133,6 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
     if (typeof type !== "string") return
 
     if (type === "REQ" && data.length >= 3 && typeof data[1] === "string") {
-      // Wire filters are untyped JSON; drop any non-object entries before trusting them. compileFilters
-      // reads every field defensively, so narrowing the surviving records to NostrFilter is sound.
       const filters = data.slice(2).filter(isRecord) as ReadonlyArray<NostrFilter>
       handleReq(ws, data[1], filters)
       return
@@ -212,9 +193,7 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
     })
 
   const stop = async (): Promise<void> => {
-    for (const ws of sockets) {
-      closeSocket(ws)
-    }
+    for (const ws of sockets) ws.close()
     sockets.clear()
     subscriptions.clear()
     if (server) {
@@ -229,7 +208,7 @@ export const createInMemoryRelay = (options: InMemoryRelayOptions = {}): InMemor
   }
 
   const dropConnections = (): void => {
-    for (const ws of sockets) closeSocket(ws)
+    for (const ws of sockets) ws.close()
     sockets.clear()
     authedSockets.clear()
     subscriptions.clear()

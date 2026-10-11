@@ -4,11 +4,66 @@ import { relayUrlFixture } from "@innis/nostr-core/testing"
 import type { BackoffRecord } from "../src/domain/value-object/backoff-record.ts"
 import type { BackoffPersistence } from "../src/application/port/backoff-persistence.ts"
 import { systemWallClock } from "../src/infrastructure/time/system-wall-clock.ts"
-import { createBackoffTracker } from "../src/application/service/backoff-tracker.ts"
+import { type BackoffTracker, createBackoffTracker } from "../src/application/service/backoff-tracker.ts"
+import { createManualTime, type ManualTime } from "./_helpers/scheduler.ts"
 
 const url = relayUrlFixture("wss://example.com")
 const other = relayUrlFixture("wss://other.example.com")
 const noop = (): void => {}
+const START = 1_000_000
+
+const trackerOn = (time: ManualTime, initial: ReadonlyArray<BackoffRecord> = []): BackoffTracker =>
+  createBackoffTracker({ onChange: noop, clock: time.clock, initial })
+
+const windowOfNextFailure = (tracker: BackoffTracker, time: ManualTime): number => {
+  tracker.recordFailure(url)
+  return (tracker.disabledUntil(url) ?? 0) - time.clock()
+}
+
+const failedOnce = (time: ManualTime): BackoffTracker => {
+  const tracker = trackerOn(time)
+  tracker.recordFailure(url)
+  return tracker
+}
+
+const clearedAfterTwoFailures = (time: ManualTime): BackoffTracker => {
+  const tracker = trackerOn(time)
+  tracker.recordFailure(url)
+  tracker.recordFailure(url)
+  tracker.clear(url)
+  return tracker
+}
+
+const hydratedStepOneReadAfterExpiry = (time: ManualTime): BackoffTracker => {
+  const tracker = trackerOn(time, [{ url, disabledUntil: START + 100, step: 1 }])
+  time.tick(500)
+  tracker.disabledUntil(url)
+  tracker.isDisabled(url)
+  return tracker
+}
+
+const persistedAfterExpiry = (): {
+  readonly persistence: ReturnType<typeof createRecordingPersistence>
+  readonly tracker: BackoffTracker
+} => {
+  const time = createManualTime(START)
+  const persistence = createRecordingPersistence()
+  const tracker = createBackoffTracker({
+    onChange: noop,
+    clock: time.clock,
+    initial: [{ url, disabledUntil: START + 20, step: 1 }],
+    persistence,
+  })
+  time.tick(40)
+  tracker.isDisabled(url)
+  return { persistence, tracker }
+}
+
+const hydratedWithOneExpired = (): BackoffTracker =>
+  trackerOn(createManualTime(START), [
+    { url, disabledUntil: START - 1_000, step: 2 },
+    { url: other, disabledUntil: START + 60_000, step: 1 },
+  ])
 
 const createRecordingPersistence = (): BackoffPersistence & {
   readonly writes: ReadonlyArray<BackoffRecord>
@@ -32,29 +87,16 @@ const createRecordingPersistence = (): BackoffPersistence & {
   }
 }
 
-Deno.test("first failure schedules ~500ms disable window", () => {
-  const tracker = createBackoffTracker({ onChange: noop, clock: systemWallClock })
-  const before = Date.now()
-  tracker.recordFailure(url)
-  const until = tracker.disabledUntil(url)
-  assertEquals(until !== null, true)
-  const window = (until ?? 0) - before
-  assertEquals(window >= 500 && window <= 600, true)
+Deno.test("first failure disables the relay until 500ms later", () => {
+  const time = createManualTime(START)
+  assertEquals(failedOnce(time).disabledUntil(url), START + 500)
 })
 
 Deno.test("repeated failures escalate the schedule", () => {
-  const tracker = createBackoffTracker({ onChange: noop, clock: systemWallClock })
-  const windows: Array<number> = []
-  for (let i = 0; i < 5; i++) {
-    const before = Date.now()
-    tracker.recordFailure(url)
-    windows.push((tracker.disabledUntil(url) ?? 0) - before)
-  }
-  for (let i = 1; i < windows.length; i++) {
-    const prev = windows[i - 1] ?? 0
-    const curr = windows[i] ?? 0
-    assertEquals(curr > prev, true)
-  }
+  const time = createManualTime(START)
+  const tracker = trackerOn(time)
+  const windows = Array.from({ length: 5 }, () => windowOfNextFailure(tracker, time))
+  assertEquals(windows, [500, 1_000, 2_000, 5_000, 15_000])
 })
 
 Deno.test("recordSuccess resets the step", () => {
@@ -68,54 +110,52 @@ Deno.test("recordSuccess resets the step", () => {
   assertEquals(window >= 500 && window <= 600, true)
 })
 
-Deno.test("isDisabled returns true while window is active and false after expiry", () => {
-  const tracker = createBackoffTracker({ onChange: noop, clock: systemWallClock })
-  tracker.recordFailure(url)
-  assertEquals(tracker.isDisabled(url), true)
-  const until = tracker.disabledUntil(url) ?? 0
-  const remaining = until - Date.now()
-  assertEquals(remaining > 0 && remaining <= 600, true)
+Deno.test("isDisabled is true while the window is active", () => {
+  assertEquals(failedOnce(createManualTime(START)).isDisabled(url), true)
 })
 
-Deno.test("disabledUntil is pure: does not mutate after expiry", () => {
-  let now = 1_000_000
-  const clock = (): number => now
-  const tracker = createBackoffTracker({
-    onChange: noop,
-    clock,
-    initial: [{ url, disabledUntil: now + 100, step: 1 }],
-  })
-  assertEquals(tracker.disabledUntil(url), now + 100)
-  now += 500
-  assertEquals(tracker.disabledUntil(url), null)
+Deno.test("isDisabled is false once the window expires", () => {
+  const time = createManualTime(START)
+  const tracker = failedOnce(time)
+  time.tick(500)
   assertEquals(tracker.isDisabled(url), false)
-  // The hydrated step should still be intact: a new failure jumps to step 2's window.
-  tracker.recordFailure(url)
-  const window = (tracker.disabledUntil(url) ?? 0) - now
-  assertEquals(window >= 1_000 && window <= 1_100, true)
 })
 
-Deno.test("clear removes disable window and step", () => {
-  const tracker = createBackoffTracker({ onChange: noop, clock: systemWallClock })
-  tracker.recordFailure(url)
-  tracker.recordFailure(url)
-  tracker.clear(url)
-  assertEquals(tracker.disabledUntil(url), null)
-  assertEquals(tracker.isDisabled(url), false)
-  const before = Date.now()
-  tracker.recordFailure(url)
-  const window = (tracker.disabledUntil(url) ?? 0) - before
-  assertEquals(window >= 500 && window <= 600, true)
+Deno.test("disabledUntil is null once a hydrated window expires", () => {
+  assertEquals(hydratedStepOneReadAfterExpiry(createManualTime(START)).disabledUntil(url), null)
 })
 
-Deno.test("hydrates from initial snapshot preserving disabledUntil and step", () => {
-  const futureUntil = Date.now() + 60_000
-  const initial: ReadonlyArray<BackoffRecord> = [
-    { url, disabledUntil: futureUntil, step: 3 },
-  ]
-  const tracker = createBackoffTracker({ onChange: noop, clock: systemWallClock, initial })
+Deno.test("isDisabled is false once a hydrated window expires", () => {
+  assertEquals(hydratedStepOneReadAfterExpiry(createManualTime(START)).isDisabled(url), false)
+})
+
+Deno.test("disabledUntil is pure: reading an expired window keeps the hydrated step for the next failure", () => {
+  const time = createManualTime(START)
+  const tracker = hydratedStepOneReadAfterExpiry(time)
+  assertEquals(windowOfNextFailure(tracker, time), 1_000)
+})
+
+Deno.test("clear removes the disable window", () => {
+  assertEquals(clearedAfterTwoFailures(createManualTime(START)).disabledUntil(url), null)
+})
+
+Deno.test("clear re-enables the relay", () => {
+  assertEquals(clearedAfterTwoFailures(createManualTime(START)).isDisabled(url), false)
+})
+
+Deno.test("clear resets the step so the next failure starts the schedule again", () => {
+  const time = createManualTime(START)
+  assertEquals(windowOfNextFailure(clearedAfterTwoFailures(time), time), 500)
+})
+
+Deno.test("hydration disables a relay whose snapshot window is still open", () => {
+  const tracker = trackerOn(createManualTime(START), [{ url, disabledUntil: START + 60_000, step: 3 }])
   assertEquals(tracker.isDisabled(url), true)
-  assertEquals(tracker.disabledUntil(url), futureUntil)
+})
+
+Deno.test("hydration preserves the snapshot's disabledUntil", () => {
+  const tracker = trackerOn(createManualTime(START), [{ url, disabledUntil: START + 60_000, step: 3 }])
+  assertEquals(tracker.disabledUntil(url), START + 60_000)
 })
 
 Deno.test("hydrated step continues the backoff sequence", () => {
@@ -129,13 +169,13 @@ Deno.test("hydrated step continues the backoff sequence", () => {
   assertEquals(window >= 5_000 && window <= 5_100, true)
 })
 
-Deno.test("recordFailure writes to persistence", () => {
+Deno.test("recordFailure writes the relay's first-step record to persistence", () => {
   const persistence = createRecordingPersistence()
-  const tracker = createBackoffTracker({ onChange: noop, clock: systemWallClock, persistence })
+  const tracker = createBackoffTracker({ onChange: noop, clock: () => START, persistence })
   tracker.recordFailure(url)
-  assertEquals(persistence.writes.length, 1)
-  assertEquals(persistence.writes[0]?.url, url)
-  assertEquals(persistence.writes[0]?.step, 1)
+  assertEquals(persistence.writes, [
+    { url, disabledUntil: START + 500, step: 1, lastFailure: { code: null, reason: "", at: START } },
+  ])
 })
 
 Deno.test("clear removes from persistence", () => {
@@ -159,31 +199,20 @@ Deno.test("recordSuccess removes from persistence when nothing left", () => {
   assertEquals(persistence.removes.includes(url), true)
 })
 
-Deno.test("isDisabled after expiry preserves step in persistence", async () => {
-  const persistence = createRecordingPersistence()
-  const tracker = createBackoffTracker({
-    onChange: noop,
-    clock: systemWallClock,
-    initial: [{ url, disabledUntil: Date.now() + 20, step: 1 }],
-    persistence,
-  })
-  assertEquals(tracker.isDisabled(url), true)
-  await new Promise((r) => setTimeout(r, 40))
-  assertEquals(tracker.isDisabled(url), false)
-  assertEquals(persistence.removes, [])
+Deno.test("isDisabled after expiry removes nothing from persistence", () => {
+  assertEquals(persistedAfterExpiry().persistence.removes, [])
+})
+
+Deno.test("isDisabled after expiry preserves the step the next failure persists", () => {
+  const { persistence, tracker } = persistedAfterExpiry()
   tracker.recordFailure(url)
   assertEquals(persistence.writes.at(-1)?.step, 2)
 })
 
-Deno.test("hydration ignores urls whose window already expired", () => {
-  const tracker = createBackoffTracker({
-    onChange: noop,
-    clock: systemWallClock,
-    initial: [
-      { url, disabledUntil: Date.now() - 1_000, step: 2 },
-      { url: other, disabledUntil: Date.now() + 60_000, step: 1 },
-    ],
-  })
-  assertEquals(tracker.isDisabled(url), false)
-  assertEquals(tracker.isDisabled(other), true)
+Deno.test("hydration ignores a url whose window already expired", () => {
+  assertEquals(hydratedWithOneExpired().isDisabled(url), false)
+})
+
+Deno.test("hydration keeps a url whose window is still open beside one that expired", () => {
+  assertEquals(hydratedWithOneExpired().isDisabled(other), true)
 })

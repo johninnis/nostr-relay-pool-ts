@@ -17,3 +17,4 @@ Every open socket sends `["CLOSE", "keepalive"]` every `heartbeatIntervalMs` (de
 - An idle subscriber survives a relay's idle timeout whenever that timeout is longer than the interval.
 - The heartbeat does not count as activity for the pool's own idle-socket close, so an unused socket still closes after `idleSocketTimeoutMs`.
 - The id `keepalive` is shared with the `ping` reply (ADR-0004).
+- Shared decision: nostr-adrs ADR-0036.

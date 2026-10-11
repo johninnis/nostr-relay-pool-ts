@@ -41,15 +41,10 @@ const createFanOut = (deps: SubscribeManyDeps, persistent: boolean): FanOut =>
       callbacks: {
         onEvent,
         onRelayEose: (relay) => {
-          // In non-persistent mode the leg self-tears-down at EOSE; drop its handle so a later
-          // syncUrls re-listing this relay reopens it rather than skipping it as still-live.
-          // A persistent leg stays open past EOSE, so its handle must remain.
           if (!persistent) openConnections.delete(relay)
           onRelayEose?.(relay)
         },
         onRelayClosed: (relay, reason) => {
-          // A relay-terminated subscription self-tears-down; drop its handle so a later syncUrls
-          // listing this relay reopens it rather than treating the dead connection as still live.
           openConnections.delete(relay)
           onRelayClosed?.(relay, reason)
         },
@@ -91,8 +86,6 @@ const createFanOut = (deps: SubscribeManyDeps, persistent: boolean): FanOut =>
   return Object.freeze({ unsubscribe, syncUrls })
 }
 
-/** The one-shot fan-out: each relay's leg closes at its EOSE. */
 export const createSubscribeMany = (deps: SubscribeManyDeps): FanOut => createFanOut(deps, false)
 
-/** The live fan-out: each relay's leg stays open past its EOSE. */
 export const createSubscribeManyLive = (deps: SubscribeManyDeps): FanOut => createFanOut(deps, true)

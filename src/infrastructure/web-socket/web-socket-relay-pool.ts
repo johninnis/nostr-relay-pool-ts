@@ -8,6 +8,7 @@ import { systemScheduler } from "../time/system-scheduler.ts"
 import type { ConnectionPool } from "../../application/port/connection-pool.ts"
 import type { RelayPool } from "../../application/port/relay-pool.ts"
 import type { RelayPoolConfig } from "../../application/port/relay-pool-config.ts"
+import type { RelayInformationLookup } from "../../application/port/relay-information-lookup.ts"
 import { createBackoffTracker } from "../../application/service/backoff-tracker.ts"
 import { createLatencyTracker } from "../../application/service/latency-tracker.ts"
 import { createSubscribeMany, createSubscribeManyLive } from "../../application/service/subscribe-many.ts"
@@ -24,7 +25,14 @@ import type { RelaySubscribeCallbacks, Subscription } from "../../domain/value-o
 import { createPublish } from "./publish.ts"
 import { createSubscribe, INACTIVE_SUBSCRIPTION } from "./subscribe.ts"
 import { createSocketManager, type PendingReconnect } from "./socket-manager.ts"
-import { abandonAuth, closeIntentionally, findWireSub, tearDownSubs } from "./relay-state.ts"
+import {
+  abandonAuth,
+  closeIntentionally,
+  findWireSub,
+  settleInFlightPublishes,
+  stopConnectionTimers,
+  tearDownSubs,
+} from "./relay-state.ts"
 import type { RelayState } from "./relay-state.ts"
 import {
   buildPoolState,
@@ -43,6 +51,7 @@ const DEFAULT_RELAY_CONNECTION_HARD_TIMEOUT_MS = 12_000
 const DEFAULT_AUTH_TIMEOUT_MS = 60_000
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000
 const DEFAULT_MAX_MESSAGE_BYTES = 262_144
+const NO_RELAY_INFORMATION: RelayInformationLookup = () => null
 
 /**
  * Construct a {@link RelayPool} backed by the host's `WebSocket`. The sole entry point of the
@@ -62,6 +71,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   const authTimeoutMs = config.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS
   const heartbeatIntervalMs = config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
   const maxMessageBytes = config.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES
+  const relayInformation = config.relayInformation ?? NO_RELAY_INFORMATION
 
   const connections = new Map<RelayUrl, RelayState>()
   const relayEventCounts = new Map<RelayUrl, number>()
@@ -74,10 +84,6 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
 
   let authHandler: AuthHandler | null = config.onAuthChallenge ?? null
   let poolStateCache: ReadonlyArray<RelayPoolStateEntry> | null = null
-  // A relay's `disabled` status and `disabledUntil` are derived live from the clock, so a cached
-  // snapshot goes stale the moment the earliest cooldown window lapses even with no intervening
-  // mutation. Cap the cache's lifetime at that instant; `null` means nothing is in cooldown and the
-  // snapshot is valid until the next mutation invalidates it.
   let poolStateCacheValidUntil: number | null = null
   let gate: (url: RelayUrl) => boolean = () => true
   let disposed = false
@@ -98,17 +104,14 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     invalidateCache()
   }
 
-  // Lifetime publish tally, mirroring relayEventCounts. Kept separate from publishHistory.length,
-  // which is a capped ring and would under-report once a relay passes the history limit.
   const incrementPublishCount = (url: RelayUrl): void => {
     relayPublishCounts.set(url, (relayPublishCounts.get(url) ?? 0) + 1)
     invalidateCache()
   }
 
   const emitConnectionChange = (url: RelayUrl, connected: boolean): void => {
-    // Snapshot is intentional — a listener that calls onConnectionChange's returned disposer
-    // during its own dispatch must not skip subsequent listeners.
-    for (const listener of [...connectionChangeListeners]) listener(url, connected)
+    const listenersBeforeDispatch = [...connectionChangeListeners]
+    for (const listener of listenersBeforeDispatch) listener(url, connected)
   }
 
   const buildMessageContext = (state: RelayState, url: RelayUrl): MessageContext => ({
@@ -141,16 +144,10 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     buildMessageContext,
   })
 
-  // The state owning a sub is usually the live connection, but a relay that dropped mid-sub parks
-  // its state on the pending reconnect — and a fresh subscribe during the backoff window can put a
-  // new live state alongside it, so ownership is decided by which state actually holds the subId.
-  const findOwningState = (url: RelayUrl, subId: SubscriptionId): RelayState | undefined => {
-    const live = connections.get(url)
-    if (live && findWireSub(live, subId)) return live
-    const parked = pendingReconnects.get(url)?.state
-    if (parked && findWireSub(parked, subId)) return parked
-    return undefined
-  }
+  const findOwningState = (url: RelayUrl, subId: SubscriptionId): RelayState | undefined =>
+    [connections.get(url), pendingReconnects.get(url)?.droppedState].find(
+      (state) => state !== undefined && findWireSub(state, subId) !== undefined,
+    )
 
   const subscribe = createSubscribe({
     clock,
@@ -162,6 +159,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     isDisposed: () => disposed,
     getOrCreateConnection: socketManager.getOrCreateConnection,
     releaseIfIdle: socketManager.releaseIfIdle,
+    relayInformation,
   })
 
   const publish = createPublish({
@@ -175,9 +173,6 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     releaseIfIdle: socketManager.releaseIfIdle,
   })
 
-  // Public boundary: normalise the raw URL once, then hand the branded RelayUrl to the core
-  // subscribe. The internal fan-outs (subscribeMany, subscribeManyLive) already hold RelayUrls and
-  // call the core directly, so a relay URL is normalised exactly once on the way in.
   const subscribeByRawUrl = (
     rawUrl: string,
     filters: ReadonlyArray<NostrFilter>,
@@ -254,30 +249,15 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     const url = parseRelayUrl(rawUrl)
     if (!url) return
     backoff.clear(url)
-    // A relay that dropped while it still had subscriptions sits in pendingReconnects: fire its
-    // reconnect now rather than wait out the (just-cleared) cooldown, so its subs are re-established
-    // at once. A relay with no queued reconnect has nothing to revive — clearing the disabled flag
-    // is enough; the next subscribe or publish opens the socket on demand, as everywhere else.
     pendingReconnects.get(url)?.fire()
   }
 
   const tearDownStateSubs = (url: RelayUrl, state: RelayState, reason: string): void =>
     tearDownSubs({ state, url, subHistory, clock, scheduler, reason })
 
-  // Settle every publish still awaiting an ack on a socket the pool is taking down. Each settle clears
-  // its own timeout and drops its in-flight record, so the relay's onclose finds an empty queue. Every
-  // teardown path (dispose, disconnect, gate-reject) pre-settles here rather than leaning on the async
-  // onclose, so an awaited publish promise resolves in the same turn as the teardown call.
-  const settleInFlightPublishes = (state: RelayState, message: string): void => {
-    for (const inFlight of [...state.inFlightPublishes.values()]) inFlight.settle({ ok: false, message })
-  }
-
   const disconnect = (rawUrl: string): void => {
     const url = parseRelayUrl(rawUrl)
     if (!url) return
-    // A relay that dropped while it still had subscriptions sits in pendingReconnects with no live
-    // socket; without cancelling that timer the pool would silently revive a relay the caller just
-    // asked to disconnect.
     socketManager.cancelPendingReconnect(url)
     const state = connections.get(url)
     if (!state) return
@@ -294,9 +274,6 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
       settleInFlightPublishes(state, "disconnected")
       closeIntentionally(state)
     }
-    // A relay that dropped with live subs sits in pendingReconnects with no socket in `connections`,
-    // so the loop above misses it. Cancel any queued reconnect the new gate now rejects — otherwise
-    // it would keep reporting `reconnecting` until the timer fired into a gate-blocked no-op.
     for (const url of [...pendingReconnects.keys()]) {
       if (!gate(url)) socketManager.cancelPendingReconnect(url)
     }
@@ -337,23 +314,20 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
   const subscribeMany = createSubscribeMany(fanOutDeps)
   const subscribeManyLive = createSubscribeManyLive(fanOutDeps)
 
+  const forgetDiagnostics = (): void => {
+    attemptedRelays.clear()
+    relayEventCounts.clear()
+    relayPublishCounts.clear()
+    subHistory.clear()
+    publishHistory.clear()
+  }
+
   const dispose = (): void => {
     if (disposed) return
     disposed = true
     for (const [url, state] of [...connections]) {
       tearDownStateSubs(url, state, "disposed")
-      if (state.stabilityTimer !== null) {
-        scheduler.clearTimer(state.stabilityTimer)
-        state.stabilityTimer = null
-      }
-      if (state.idleTimer !== null) {
-        scheduler.clearTimer(state.idleTimer)
-        state.idleTimer = null
-      }
-      if (state.heartbeatTimer !== null) {
-        scheduler.clearTimer(state.heartbeatTimer)
-        state.heartbeatTimer = null
-      }
+      stopConnectionTimers(state, scheduler)
       abandonAuth(state, scheduler)
       settleInFlightPublishes(state, "disposed")
       closeIntentionally(state)
@@ -362,13 +336,7 @@ export const createRelayPool = (config: RelayPoolConfig = {}): RelayPool => {
     for (const reconnect of pendingReconnects.values()) reconnect.cancel()
     pendingReconnects.clear()
     connectionChangeListeners.clear()
-    // Drop the diagnostic stores too: a disposed pool serves no further reads, so retaining them
-    // would only pin memory for a reference the host is expected to release.
-    attemptedRelays.clear()
-    relayEventCounts.clear()
-    relayPublishCounts.clear()
-    subHistory.clear()
-    publishHistory.clear()
+    forgetDiagnostics()
     invalidateCache()
   }
 

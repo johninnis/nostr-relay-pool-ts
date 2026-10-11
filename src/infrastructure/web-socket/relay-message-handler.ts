@@ -1,11 +1,17 @@
-import type { AuthChallenge, NostrEvent, RelayMessage, RelayUrl, SubscriptionId } from "@innis/nostr-core"
-import { authChallengesEqual, parseRelayMessage, serialiseAuthMessage, serialiseEventMessage } from "@innis/nostr-core"
+import type { AuthChallenge, EoseMessage, NostrEvent, RelayMessage, RelayUrl, SubscriptionId } from "@innis/nostr-core"
+import { eoseHasHint, parseRelayMessage, serialiseAuthMessage, serialiseEventMessage } from "@innis/nostr-core"
 import type { AuthHandler } from "../../application/port/auth-handler.ts"
 import type { WallClock } from "../../application/port/clock.ts"
 import type { Scheduler } from "../../application/port/scheduler.ts"
 import { closeSubHistory, type SubHistoryRecord } from "../../application/service/relay-history.ts"
 import type { RelayState } from "./relay-state.ts"
-import { cancelAuthTimer, cancelPendingSubTimeout, promoteAuthedSubs, releaseAuthAttempt } from "./relay-state.ts"
+import {
+  cancelAuthTimer,
+  cancelPendingSubTimeout,
+  reissueAuthParkedSubs,
+  releaseAuthAttempt,
+  widenNarrowedSubs,
+} from "./relay-state.ts"
 import { sendKeepalive, sendOnWebSocket } from "./web-socket-helpers.ts"
 import type { WireSub } from "./wire-sub.ts"
 
@@ -25,7 +31,8 @@ export interface MessageContext {
 
 const textEncoder = new TextEncoder()
 
-const PING_NOTICE = "ping"
+// Deliberate: a ping is surrounded only by space, tab, line feed, carriage return, vertical tab or NUL, never other whitespace — see shared ADR-0035 and ADR-0004
+const PING_NOTICE = /^[ \t\n\r\v\0]*ping[ \t\n\r\v\0]*$/i
 const AUTH_REJECTED = "auth-required: auth rejected: "
 const AUTH_DECLINED = "auth-required: auth declined"
 const AUTH_TIMED_OUT = "auth-required: auth timed out"
@@ -72,13 +79,14 @@ const answerChallenge = async (ctx: MessageContext, challenge: AuthChallenge): P
   if (handler === null || state.ws === null) return
   const attempt = Symbol("auth attempt")
   state.authAttempt = attempt
-  state.answeredChallenge = challenge
+  state.unansweredChallenge = null
   restartAuthTimer(ctx)
   try {
     const signed = await handler(ctx.url, challenge)
     if (state.authAttempt !== attempt) return
     if (signed === null) {
-      state.authDeclined = true
+      // Deliberate: a decline holds for the challenge declined, not one the relay sent while the handler decided — see shared ADR-0030 and ADR-0002
+      state.authDeclined = state.unansweredChallenge === null
       releaseAuthParked(ctx, AUTH_DECLINED)
       endAuthAttempt(ctx)
       ctx.onStateChange()
@@ -99,21 +107,17 @@ const answerChallenge = async (ctx: MessageContext, challenge: AuthChallenge): P
   }
 }
 
-const handleAuthChallenge = (ctx: MessageContext, challenge: AuthChallenge): void => {
-  ctx.state.challenge = challenge
-  ctx.state.authDeclined = false
-  if (ctx.state.authed || ctx.state.authAttempt !== null) return
-  answerChallenge(ctx, challenge)
-}
-
-const isAnswered = (challenge: AuthChallenge, answered: AuthChallenge | null): boolean =>
-  answered !== null && authChallengesEqual(challenge, answered)
-
 const answerStoredChallenge = (ctx: MessageContext): void => {
   const { state } = ctx
-  if (state.authed || state.authAttempt !== null) return
-  if (state.challenge === null || isAnswered(state.challenge, state.answeredChallenge)) return
-  answerChallenge(ctx, state.challenge)
+  if (state.authed || state.authAttempt !== null || state.unansweredChallenge === null) return
+  answerChallenge(ctx, state.unansweredChallenge)
+}
+
+// Deliberate: every challenge frame is a new challenge, even one repeating the string whose answer is in flight — see shared ADR-0030 and ADR-0002
+const handleAuthChallenge = (ctx: MessageContext, challenge: AuthChallenge): void => {
+  ctx.state.unansweredChallenge = challenge
+  ctx.state.authDeclined = false
+  answerStoredChallenge(ctx)
 }
 
 const endSub = (ctx: MessageContext, wireSub: WireSub, reason: string): void => {
@@ -121,11 +125,12 @@ const endSub = (ctx: MessageContext, wireSub: WireSub, reason: string): void => 
   for (const listener of wireSub.listeners) listener.onClosed?.(reason)
 }
 
-const resumeAuthParked = (ctx: MessageContext): void => {
+const resumeAfterAuth = (ctx: MessageContext): void => {
   const { state } = ctx
   state.authed = true
   if (state.ws === null) return
-  promoteAuthedSubs(state, ctx.clock)
+  reissueAuthParkedSubs(state, ctx.clock)
+  widenNarrowedSubs(state, ctx.clock)
   for (const eventId of state.pendingAuthPublish) {
     const inFlight = state.inFlightPublishes.get(eventId)
     if (!inFlight) continue
@@ -151,7 +156,7 @@ const releaseAuthParked = (ctx: MessageContext, reason: string): void => {
 // Deliberate: an auth-required answer to our AUTH asks for the fresh challenge, not a final refusal — see ADR-0001
 const handleAuthOk = (ctx: MessageContext, message: OkMessage): void => {
   releaseAuthAttempt(ctx.state)
-  if (message.accepted) resumeAuthParked(ctx)
+  if (message.accepted) resumeAfterAuth(ctx)
   else if (message.reason === "auth-required") answerStoredChallenge(ctx)
   else releaseAuthParked(ctx, AUTH_REJECTED + message.message)
   stopAuthTimerWhenSettled(ctx)
@@ -178,31 +183,34 @@ const handleOk = (ctx: MessageContext, message: OkMessage): void => {
 
 // Deliberate: a ping NOTICE is a liveness probe answered with a keepalive CLOSE, not a message — see ADR-0004
 const handleNotice = (ctx: MessageContext, notice: string): void => {
-  if (notice.trim().toLowerCase() !== PING_NOTICE || ctx.state.ws === null) return
+  if (!PING_NOTICE.test(notice) || ctx.state.ws === null) return
   sendKeepalive(ctx.state.ws)
 }
 
 const handleEvent = (ctx: MessageContext, subId: SubscriptionId, event: NostrEvent): void => {
   const wireSub = ctx.state.subs.get(subId)
   if (!wireSub) return
-  if (!wireSub.compiled.matches(event)) return
+  if (!wireSub.compiledWithoutSearch.matches(event)) return
   ctx.onEventReceived(ctx.url)
   const historyEntry = ctx.subHistory.get(ctx.url)?.get(subId)
   if (historyEntry) historyEntry.eventCount++
-  // Listener arrays are copy-on-write: never mutated in place, only replaced. `for...of` evaluates
-  // `wireSub.listeners` once, so an onEvent that re-enters the pool (subscribe or unsubscribe on
-  // this same filter hash) swaps in a new array without affecting the in-flight iteration.
   for (const listener of wireSub.listeners) listener.onEvent(event, ctx.url)
 }
 
-const handleEose = (ctx: MessageContext, subId: SubscriptionId): void => {
-  const wireSub = ctx.state.subs.get(subId)
+// Deliberate: a read the relay narrowed until AUTH stays open, and is sent again once the relay accepts our AUTH, before or after its EOSE — see shared ADR-0030 and ADR-0010
+const awaitWidening = (ctx: MessageContext, wireSub: WireSub): void => {
+  if (wireSub.widening === "sent") return
+  wireSub.widening = "awaiting-auth"
+  if (ctx.state.authed) widenNarrowedSubs(ctx.state, ctx.clock)
+}
+
+const handleEose = (ctx: MessageContext, eose: EoseMessage): void => {
+  const wireSub = ctx.state.subs.get(eose.subscriptionId)
   if (!wireSub || wireSub.eoseFired) return
   wireSub.eoseFired = true
-  // Measure against the live REQ, not the original subscribe time: reqSentAt is re-stamped on every
-  // reconnect/auth re-issue, so a long backoff window never leaks into the latency sample.
-  if (wireSub.reqSentAt > 0) ctx.onEoseLatency(ctx.url, ctx.clock() - wireSub.reqSentAt)
+  if (wireSub.lastReqSentAt > 0) ctx.onEoseLatency(ctx.url, ctx.clock() - wireSub.lastReqSentAt)
   for (const listener of wireSub.listeners) listener.onEose?.()
+  if (eoseHasHint(eose, "auth")) awaitWidening(ctx, wireSub)
 }
 
 const handleClosed = (ctx: MessageContext, { subscriptionId: subId, message, reason }: ClosedMessage): void => {
@@ -215,17 +223,10 @@ const handleClosed = (ctx: MessageContext, { subscriptionId: subId, message, rea
   cancelPendingSubTimeout(state, ctx.scheduler, subId)
 
   if (reason === "auth-required" && canAwaitAuth(ctx)) {
-    // The sub is re-parked, not closed: it lives on in pendingAuthSubs awaiting the AUTH handshake,
-    // so its history entry stays open. Stamping closedAt here would mislabel a still-pending sub as
-    // closed (masked while live, but wrong the moment it later genuinely closes).
     state.pendingAuthSubs.set(subId, wireSub)
     answerStoredChallenge(ctx)
     ensureAuthTimer(ctx)
   } else {
-    // A relay-initiated CLOSED terminates the subscription — unlike a socket drop it will not be
-    // revived. Fire the distinct onClosed terminal signal: CLOSED is not EOSE, so a persistent
-    // listener learns the stream is dead rather than that the backlog merely ended, and an
-    // EOSE-or-timeout fan-in settles now instead of hanging until its hard timeout.
     endSub(ctx, wireSub, message)
     closeSubHistory({ subHistory: ctx.subHistory, url: ctx.url, subId, clock: ctx.clock })
   }
@@ -250,7 +251,7 @@ export const handleRelayMessage = (ctx: MessageContext, msg: MessageEvent): void
       handleEvent(ctx, message.subscriptionId, message.event)
       return
     case "EOSE":
-      handleEose(ctx, message.subscriptionId)
+      handleEose(ctx, message)
       return
     case "CLOSED":
       handleClosed(ctx, message)
